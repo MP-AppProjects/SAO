@@ -4363,7 +4363,7 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
                         text_auto='.2f'
                     )
                     fig.update_layout(height=max(400, len(corr_vars) * 40 + 100))
-                    st.plotly_chart(fig, use_container_width=True, key=f"pc_ols_{res.get('dep_var','ols')}_diag")
+                    st.plotly_chart(fig, use_container_width=True, key=f"pc_corr_heatmap_{corr_method}")
 
             except Exception as e:
                 st.error(str(e))
