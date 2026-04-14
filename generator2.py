@@ -128,15 +128,17 @@ class ExcelMeta:
 
 
 @st.cache_data
-def load_excel_data(uploaded_file, sheet_name, col_type_overrides_json="{}"):
+def load_excel_data(uploaded_file, sheet_name, col_type_overrides_json="{}", custom_missing_json="{}"):
     """
     Load an Excel file.
     Row 1 = variable names, row 2+ = data.
     col_type_overrides_json: JSON string of {col: 'numeric'|'categorical'}
-    (JSON string is hashable, enabling proper Streamlit cache keying)
+    custom_missing_json:     JSON string of {col: [val, ...]} missing values per column
+    (JSON strings are hashable, enabling proper Streamlit cache keying)
     Returns (df_raw, df_labeled, ExcelMeta)
     """
     col_type_overrides = json.loads(col_type_overrides_json)
+    custom_missing     = json.loads(custom_missing_json)
     df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=0)
 
     # Clean column names
@@ -146,11 +148,46 @@ def load_excel_data(uploaded_file, sheet_name, col_type_overrides_json="{}"):
     df_raw = df.copy()
     df_labeled = df.copy()
 
+    # Collect text\u2192numeric mappings to store as value labels
+    _text_to_num_maps = {}  # {col: {1: 'Kobieta', 2: 'M\u0119\u017cczyzna', ...}}
+
+    def _missing_str_set(col):
+        """Build set of string representations of missing values for a column."""
+        m_vals = custom_missing.get(col, [])
+        s = set()
+        for v in m_vals:
+            s.add(str(v))
+            try:
+                s.add(str(int(float(v))))
+                s.add(str(float(v)))
+            except (ValueError, TypeError):
+                pass
+        return s
+
     for col in df.columns:
         override = col_type_overrides.get(col)
         if override == 'numeric':
-            df_raw[col] = pd.to_numeric(df_raw[col], errors='coerce')
-            df_labeled[col] = df_raw[col].copy()
+            # Try direct numeric conversion first
+            numeric_attempt = pd.to_numeric(df_raw[col], errors='coerce')
+            non_null = df_raw[col].dropna()
+            survived = numeric_attempt.notna().sum()
+            if len(non_null) == 0 or survived / len(non_null) >= 0.9:
+                df_raw[col]    = numeric_attempt
+                df_labeled[col] = numeric_attempt.copy()
+            else:
+                # Column is text \u2014 encode as consecutive integers 1, 2, 3...
+                # Skip values that are defined as missing
+                miss_strs = _missing_str_set(col)
+                unique_vals = sorted(
+                    [v for v in df_raw[col].dropna().unique()
+                     if str(v) not in miss_strs],
+                    key=lambda x: str(x)
+                )
+                code_map  = {v: i + 1 for i, v in enumerate(unique_vals)}
+                label_map = {i + 1: str(v) for i, v in enumerate(unique_vals)}
+                df_raw[col]    = df_raw[col].map(code_map)   # missing vals \u2192 NaN
+                df_labeled[col] = df_raw[col].copy()
+                _text_to_num_maps[col] = label_map
         elif override == 'categorical':
             df_raw[col]    = df_raw[col].astype(str).where(df_raw[col].notna(), np.nan)
             df_labeled[col] = df_raw[col].copy()
@@ -166,6 +203,7 @@ def load_excel_data(uploaded_file, sheet_name, col_type_overrides_json="{}"):
                 # else: leave as object (categorical)
 
     meta = ExcelMeta(df.columns.tolist())
+    meta._text_to_num_maps = _text_to_num_maps
     return df_raw, df_labeled, meta
 
 def auto_detect_mrs(df_raw):
@@ -1995,6 +2033,7 @@ if 'matrix_sets'         not in st.session_state: st.session_state.matrix_sets =
 if 'matrix_results'      not in st.session_state: st.session_state.matrix_results = []
 if 'custom_var_labels'   not in st.session_state: st.session_state.custom_var_labels = {}
 if 'custom_val_labels'   not in st.session_state: st.session_state.custom_val_labels = {}
+if 'user_cleared_val_labels' not in st.session_state: st.session_state.user_cleared_val_labels = set()
 if 'box_sets'            not in st.session_state: st.session_state.box_sets = defaultdict(dict)
 if 'segmentations'       not in st.session_state: st.session_state.segmentations = []
 if 'hclust_results'      not in st.session_state: st.session_state.hclust_results = []
@@ -2075,11 +2114,19 @@ with st.spinner("Wczytywanie i strukturyzowanie bazy..."):
         loaded_name = uploaded_file.name
     else:
         _overrides_json = json.dumps(st.session_state.excel_col_types, sort_keys=True)
+        _missing_json   = json.dumps(st.session_state.custom_missing, sort_keys=True)
         df_orig_raw, df_orig, meta_orig = load_excel_data(
             excel_file, selected_sheet,
-            col_type_overrides_json=_overrides_json
+            col_type_overrides_json=_overrides_json,
+            custom_missing_json=_missing_json
         )
         loaded_name = excel_file.name
+        # Apply text\u2192numeric encoding maps as value labels (only for newly encoded cols)
+        _tnm = getattr(meta_orig, '_text_to_num_maps', {})
+        for _col, _lmap in _tnm.items():
+            if (_col not in st.session_state.custom_val_labels
+                    and _col not in st.session_state.user_cleared_val_labels):
+                st.session_state.custom_val_labels[_col] = _lmap
 
 df_raw = df_orig_raw.copy()
 df     = df_orig.copy()
@@ -2119,14 +2166,37 @@ if st.session_state.treat_empty_as_miss:
 # Apply custom missing values
 for c, m_vals in st.session_state.custom_missing.items():
     if c in df_raw.columns:
-        df_raw[c] = df_raw[c].replace(m_vals, np.nan)
+        # Build a comprehensive replace list:
+        # - original values (numeric)
+        # - string versions: "999", "999.0"  (for object/text columns)
+        # - int versions: 999 (for columns stored as int64)
+        replace_vals = []
+        for v in m_vals:
+            replace_vals.append(v)
+            try:
+                iv = int(v)
+                replace_vals.append(iv)
+                replace_vals.append(str(iv))          # "999"
+            except (ValueError, TypeError):
+                pass
+            try:
+                replace_vals.append(str(v))           # "999.0"
+                replace_vals.append(str(float(v)))
+            except (ValueError, TypeError):
+                pass
+        replace_vals = list(dict.fromkeys(replace_vals))  # deduplicate, preserve order
+
+        df_raw[c] = df_raw[c].replace(replace_vals, np.nan)
         if is_spss:
-            df[c] = df[c].replace(
-                [meta_orig.variable_value_labels.get(c, {}).get(v)
-                 for v in m_vals if v in meta_orig.variable_value_labels.get(c, {})],
-                np.nan)
+            # Also replace value-labelled versions in df
+            label_vals = [
+                meta_orig.variable_value_labels.get(c, {}).get(v)
+                for v in m_vals
+                if v in meta_orig.variable_value_labels.get(c, {})
+            ]
+            df[c] = df[c].replace(label_vals + replace_vals, np.nan)
         else:
-            df[c] = df[c].replace(m_vals, np.nan)
+            df[c] = df[c].replace(replace_vals, np.nan)
 
 hidden_cols = set()
 for set_data in st.session_state.mrs_sets.values():
@@ -2490,6 +2560,7 @@ elif menu == "\U0001f4c1 Projekt i S\u0142ownik":
                 "box_sets":            dict(st.session_state.box_sets),
                 "custom_var_labels":   st.session_state.custom_var_labels,
                 "custom_val_labels":   st.session_state.custom_val_labels,
+                "user_cleared_val_labels": list(st.session_state.user_cleared_val_labels),
                 "recodings":           st.session_state.recodings,
                 "cleaning_ops":        st.session_state.cleaning_ops,
                 "segmentations":       st.session_state.segmentations,
@@ -2635,6 +2706,7 @@ elif menu == "\U0001f4c1 Projekt i S\u0142ownik":
                         st.session_state.recodings         = raw_data.get("recodings", [])
                         st.session_state.cleaning_ops      = raw_data.get("cleaning_ops", [])
                         st.session_state.custom_missing    = raw_data.get("custom_missing", {})
+                        st.session_state.user_cleared_val_labels = set(raw_data.get("user_cleared_val_labels", []))
                         st.session_state.weight_targets    = raw_data.get("weight_targets", {})
                         st.session_state.treat_empty_as_miss = raw_data.get("treat_empty_as_miss", False)
                         st.session_state.excel_col_types   = raw_data.get("excel_col_types", {})
@@ -2703,115 +2775,30 @@ elif menu == "\U0001f4c1 Projekt i S\u0142ownik":
         st.dataframe(pd.DataFrame(summ_rows), use_container_width=True, height=400)
 
     with tab_dict:
-        st.markdown("#### S\u0142ownik zmiennych -- etykiety i warto\u015bci")
-
-        if 'custom_var_labels' not in st.session_state:
-            st.session_state.custom_var_labels = {}
-        if 'custom_val_labels' not in st.session_state:
-            st.session_state.custom_val_labels = {}
-
+        st.markdown("#### S\u0142ownik zmiennych")
+        st.info("\U0001f3f7\ufe0f Edycja etykiet zmiennych i warto\u015bci dost\u0119pna w module "
+                "**Przygotowanie Danych \u2192 Etykiety**.")
         dict_rows = []
         for col in df_raw.columns:
-            orig_lbl = meta_orig.column_names_to_labels.get(col, '')
+            orig_lbl = meta_orig.column_names_to_labels.get(col, "")
             curr_lbl = var_labels.get(col, orig_lbl)
-            has_vl   = bool(meta_orig.variable_value_labels.get(col)) or bool(st.session_state.custom_val_labels.get(col))
-            dict_rows.append({'Zmienna': col, 'Etykieta bie\u017c\u0105ca': curr_lbl,
-                               'Etykieta oryginalna': orig_lbl, 'Typ': str(df_raw[col].dtype),
-                               'Et. warto\u015bci': '\u2705' if has_vl else '--'})
-        st.dataframe(pd.DataFrame(dict_rows), use_container_width=True, height=250)
+            has_vl   = (bool(meta_orig.variable_value_labels.get(col))
+                        or bool(st.session_state.custom_val_labels.get(col)))
+            is_custom_var = col in st.session_state.custom_var_labels
+            is_custom_val = col in st.session_state.custom_val_labels
+            dict_rows.append({
+                "Zmienna": col,
+                "Etykieta bie\u017c\u0105ca": curr_lbl,
+                "Etykieta oryginalna": orig_lbl,
+                "Typ": str(df_raw[col].dtype),
+                "Et. warto\u015bci": "\u2705" if has_vl else "--",
+                "Zmodyfikowana": ("\U0001f3f7\ufe0f+\u270f\ufe0f" if is_custom_var and is_custom_val
+                                  else "\U0001f3f7\ufe0f" if is_custom_val
+                                  else "\u270f\ufe0f" if is_custom_var else ""),
+            })
+        st.dataframe(pd.DataFrame(dict_rows), use_container_width=True, height=420)
+        st.caption("\u270f\ufe0f = zmieniona etykieta zmiennej | \U0001f3f7\ufe0f = zmienione etykiety warto\u015bci")
 
-        st.divider()
-        dict_sub_var, dict_sub_val = st.tabs(["\u270f\ufe0f Etykieta zmiennej", "\U0001f3f7\ufe0f Etykiety warto\u015bci (kody)"])
-
-        # -- Edycja etykiety zmiennej --------------------------
-        with dict_sub_var:
-            col_ev1, col_ev2 = st.columns(2)
-            with col_ev1:
-                edit_var = st.selectbox("Zmienna:", df_raw.columns,
-                                         format_func=lambda x: f"[{x}] {var_labels.get(x, x)}",
-                                         key="dict_edit_var")
-                new_lbl = st.text_input("Nowa etykieta:", value=var_labels.get(edit_var, ''), key="dict_new_lbl")
-                if st.button("\U0001f4be Zapisz etykiet\u0119 zmiennej", key="save_var_lbl", use_container_width=True):
-                    st.session_state.custom_var_labels[edit_var] = new_lbl
-                    var_labels[edit_var] = new_lbl
-                    st.success(f"Zapisano etykiet\u0119 `{edit_var}`.")
-                    st.rerun()
-            with col_ev2:
-                st.markdown("**Etykiety warto\u015bci tej zmiennej (SPSS):**")
-                spss_vvl_preview = meta_orig.variable_value_labels.get(edit_var, {})
-                cust_vl_preview  = st.session_state.custom_val_labels.get(edit_var, {})
-                if spss_vvl_preview or cust_vl_preview:
-                    preview_rows = []
-                    for k, v in sorted(spss_vvl_preview.items()):
-                        preview_rows.append({'Kod': k,
-                                             'Etykieta SPSS' if is_spss else 'Etykieta': v,
-                                             'Etykieta niestandardowa': cust_vl_preview.get(str(k), '--')})
-                    for raw_k, custom_v in cust_vl_preview.items():
-                        if not any(str(r['Kod']) == raw_k for r in preview_rows):
-                            preview_rows.append({'Kod': raw_k,
-                                                 'Etykieta SPSS' if is_spss else 'Etykieta': '--',
-                                                 'Etykieta niestandardowa': custom_v})
-                    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
-                else:
-                    uniq = sorted(df_raw[edit_var].dropna().unique())
-                    lbl_src = "Brak etykiet SPSS." if is_spss else "Brak etykiet."
-                    st.info(f"{lbl_src} Unikalne warto\u015bci: {', '.join(str(v) for v in uniq[:20])}"
-                            + (" ..." if len(uniq) > 20 else ""))
-
-        # -- Edycja etykiet warto?ci ---------------------------
-        with dict_sub_val:
-            st.markdown("Zmie\u0144 wy\u015bwietlane etykiety warto\u015bci (kod\u00f3w) dla wybranej zmiennej. Zmiany wp\u0142ywaj\u0105 na nag\u0142\u00f3wki wierszy w tabelach matrycowych i etykiety w analizach.")
-            col_vv1, col_vv2 = st.columns([1, 1])
-            with col_vv1:
-                val_edit_var = st.selectbox(
-                    "Zmienna:", df_raw.columns,
-                    format_func=lambda x: f"[{x}] {var_labels.get(x, x)}",
-                    key="dict_val_edit_var"
-                )
-                spss_codes = meta_orig.variable_value_labels.get(val_edit_var, {})
-                raw_vals   = sorted(df_raw[val_edit_var].dropna().unique())
-                vl_src_lbl = "etykiet SPSS" if is_spss else "etykiet warto\u015bci"
-                st.caption(f"{len(raw_vals)} unikalnych warto\u015bci \u00b7 {len(spss_codes)} {vl_src_lbl}")
-
-                display_items = {}   # raw_str ? spss_label_or_raw
-                for v in raw_vals:
-                    raw_str  = str(v)
-                    spss_lbl = spss_codes.get(v, spss_codes.get(raw_str, ''))
-                    display_items[raw_str] = spss_lbl if spss_lbl else raw_str
-
-                if len(display_items) > 50:
-                    st.warning(f"Wy\u015bwietlono pierwsze 50 z {len(display_items)} warto\u015bci.")
-                    display_items = dict(list(display_items.items())[:50])
-
-            with col_vv2:
-                st.markdown("**Nowe etykiety wy\u015bwietlania:**")
-                existing_custom = st.session_state.custom_val_labels.get(val_edit_var, {})
-                new_val_map = {}
-                for raw_str, spss_lbl in display_items.items():
-                    current = existing_custom.get(raw_str, spss_lbl)
-                    hint = f" [{spss_lbl}]" if spss_lbl and spss_lbl != raw_str else ""
-                    new_label = st.text_input(
-                        f"Kod {raw_str}{hint}:",
-                        value=current,
-                        key=f"vl_{val_edit_var}_{raw_str}"
-                    )
-                    new_val_map[raw_str] = new_label
-
-                col_bsave, col_bclear = st.columns(2)
-                with col_bsave:
-                    if st.button("\U0001f4be Zapisz etykiety warto\u015bci", key="save_val_lbls",
-                                  use_container_width=True, type="primary"):
-                        filtered = {k: v for k, v in new_val_map.items() if v.strip() and v.strip() != k}
-                        st.session_state.custom_val_labels[val_edit_var] = filtered
-                        st.success(f"Zapisano {len(filtered)} etykiet dla `{val_edit_var}`.")
-                        st.rerun()
-                with col_bclear:
-                    if existing_custom and st.button("\U0001f5d1\ufe0f Usu\u0144 niestandardowe", key="clear_val_lbls",
-                                                      use_container_width=True):
-                        st.session_state.custom_val_labels.pop(val_edit_var, None)
-                        st.rerun()
-
-        # custom_var_labels applied at load time -- no reapplication needed.
 
 # -------------------------------------------------------------
 # MODU? 2: PRZYGOTOWANIE DANYCH
@@ -2820,18 +2807,18 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
     module_header("\U0001f6e0\ufe0f", "Przygotowanie Danych")
     # For Excel: add an extra tab for type overrides
     if is_excel:
-        tab_miss, tab_types, tab_clean, tab_mrs, tab_matrix, tab_weight, tab_recode, tab_box = st.tabs([
-            "\u26a0\ufe0f Braki", "\U0001f522 Typy", "\U0001f9f9 Czyszczenie",
+        tab_miss, tab_labels, tab_types, tab_clean, tab_mrs, tab_matrix, tab_weight, tab_recode, tab_box = st.tabs([
+            "\u26a0\ufe0f Braki", "\U0001f3f7\ufe0f Etykiety", "\U0001f522 Typy", "\U0001f9f9 Czyszczenie",
             "\U0001f5f9 Wielokrotne odp.", "\U0001f4cb Matrycowe",
             "\u2696\ufe0f Wa\u017cenie", "\U0001f504 Rekodowanie", "\U0001f4e6 Top/Bottom Box"
         ])
     else:
-        tab_miss, tab_clean, tab_mrs, tab_matrix, tab_weight, tab_recode, tab_box = st.tabs([
-            "\u26a0\ufe0f Braki", "\U0001f9f9 Czyszczenie",
+        tab_miss, tab_labels, tab_clean, tab_mrs, tab_matrix, tab_weight, tab_recode, tab_box = st.tabs([
+            "\u26a0\ufe0f Braki", "\U0001f3f7\ufe0f Etykiety", "\U0001f9f9 Czyszczenie",
             "\U0001f5f9 Wielokrotne odp.", "\U0001f4cb Matrycowe",
             "\u2696\ufe0f Wa\u017cenie", "\U0001f504 Rekodowanie", "\U0001f4e6 Top/Bottom Box"
         ])
-        tab_types = None   # not used for SPSS
+        tab_types = None
 
     # -- BRAKI DANYCH ---------------------------------
     with tab_miss:
@@ -2861,21 +2848,50 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
                         for c in df_raw.columns:
                             st.session_state.custom_missing[c] = vals
                         st.success(f"Zastosowano braki {vals} do wszystkich zmiennych.")
-                    except:
+                    except Exception:
                         st.error("Wprowad\u017a poprawne liczby.")
             with col2:
                 st.markdown("**Braki dla konkretnej zmiennej**")
-                var_missing = st.selectbox("Zmienna:", df_raw.columns, format_func=lambda x: get_var_display_name(x, var_labels), key="missing_var_select")
-                var_missing_vals = st.multiselect("Warto\u015bci traktowane jako braki:", sorted(df_raw[var_missing].dropna().unique()))
+                var_missing = st.selectbox("Zmienna:", df_raw.columns,
+                    format_func=lambda x: get_var_display_name(x, var_labels),
+                    key="missing_var_select")
+                var_missing_vals = st.multiselect("Warto\u015bci traktowane jako braki:",
+                    sorted(df_raw[var_missing].dropna().unique(), key=lambda x: str(x)))
                 if st.button("Ustaw braki dla tej zmiennej", use_container_width=True):
                     st.session_state.custom_missing[var_missing] = var_missing_vals
                     st.success("Zapisano!")
+
             if st.session_state.custom_missing:
-                if st.button("\U0001f5d1\ufe0f Wyczy\u015b\u0107 wszystkie w\u0142asne braki", type="secondary"):
+                st.divider()
+                st.markdown(f"**\U0001f4cb Zapisane braki danych ({len(st.session_state.custom_missing)} zmiennych):**")
+
+                for _col, _vals in list(st.session_state.custom_missing.items()):
+                    mc1, mc2, mc3, mc4 = st.columns([3, 3, 2, 1])
+                    mc1.markdown(f"`{_col}` {var_labels.get(_col, '')}")
+                    new_miss_str = mc2.text_input(
+                        "", value=", ".join(str(v) for v in _vals),
+                        key=f"miss_edit_{_col}", label_visibility="collapsed"
+                    )
+                    with mc3:
+                        if st.button("\U0001f4be Zapisz", key=f"miss_upd_{_col}",
+                                     use_container_width=True):
+                            try:
+                                new_vals = [float(x.strip())
+                                            for x in new_miss_str.split(',') if x.strip()]
+                                st.session_state.custom_missing[_col] = new_vals
+                                st.rerun()
+                            except Exception:
+                                st.error("Nieprawid\u0142owe warto\u015bci.")
+                    with mc4:
+                        if st.button("\U0001f5d1\ufe0f", key=f"miss_del_{_col}",
+                                     help=f"Usu\u0144 braki dla {_col}"):
+                            st.session_state.custom_missing.pop(_col, None)
+                            st.rerun()
+
+                if st.button("\U0001f5d1\ufe0f Usu\u0144 wszystkie braki danych", type="secondary",
+                              use_container_width=True, key="miss_clear_all"):
                     st.session_state.custom_missing = {}
                     st.rerun()
-                with st.expander("Podgl\u0105d aktualnych ustawie\u0144 brak\u00f3w"):
-                    st.json(st.session_state.custom_missing)
 
     # -- REKODOWANIE -----------------------------------
     with tab_recode:
@@ -2974,6 +2990,210 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
                     to_del = i
             if to_del is not None:
                 st.session_state.recodings.pop(to_del)
+                st.rerun()
+
+    # -- ETYKIETY ZMIENNYCH I WARTOSCI ----------------
+    with tab_labels:
+        st.markdown("#### \U0001f3f7\ufe0f Etykiety zmiennych i warto\u015bci")
+
+        lab_sub_var, lab_sub_val, lab_sub_all = st.tabs([
+            "\u270f\ufe0f Etykieta zmiennej",
+            "\U0001f3f7\ufe0f Etykiety warto\u015bci (kody)",
+            "\U0001f4cb Wszystkie moje zmiany"
+        ])
+
+        # \u2500\u2500 Sub-tab 1: Variable label \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        with lab_sub_var:
+            col_ev1, col_ev2 = st.columns(2)
+            with col_ev1:
+                edit_var = st.selectbox("Zmienna:", df_raw.columns,
+                    format_func=lambda x: f"[{x}] {var_labels.get(x, x)}",
+                    key="lab_edit_var")
+                new_lbl = st.text_input("Nowa etykieta:",
+                    value=var_labels.get(edit_var, ''), key="lab_new_lbl")
+                bcol1, bcol2 = st.columns(2)
+                with bcol1:
+                    if st.button("\U0001f4be Zapisz", key="lab_save_var_lbl",
+                                 use_container_width=True, type="primary"):
+                        st.session_state.custom_var_labels[edit_var] = new_lbl
+                        var_labels[edit_var] = new_lbl
+                        st.success(f"Zapisano etykiet\u0119 `{edit_var}`.")
+                        st.rerun()
+                with bcol2:
+                    if edit_var in st.session_state.custom_var_labels:
+                        if st.button("\U0001f5d1\ufe0f Usu\u0144", key="lab_del_var_lbl",
+                                     use_container_width=True):
+                            st.session_state.custom_var_labels.pop(edit_var, None)
+                            st.rerun()
+            with col_ev2:
+                st.markdown("**Etykiety warto\u015bci tej zmiennej:**")
+                spss_vvl_preview = meta_orig.variable_value_labels.get(edit_var, {})
+                cust_vl_preview  = st.session_state.custom_val_labels.get(edit_var, {})
+                if spss_vvl_preview or cust_vl_preview:
+                    preview_rows = []
+                    for k, v in sorted(spss_vvl_preview.items()):
+                        preview_rows.append({'Kod': k, 'Etykieta \u017ar\u00f3d\u0142owa': v,
+                            'Niestandardowa': cust_vl_preview.get(str(k), '--')})
+                    for rk, cv in cust_vl_preview.items():
+                        if not any(str(r['Kod']) == rk for r in preview_rows):
+                            preview_rows.append({'Kod': rk, 'Etykieta \u017ar\u00f3d\u0142owa': '--',
+                                'Niestandardowa': cv})
+                    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+                else:
+                    uniq = sorted(df_raw[edit_var].dropna().unique())
+                    st.info(f"Brak etykiet warto\u015bci. Unikalne warto\u015bci: "
+                            f"{', '.join(str(v) for v in uniq[:20])}"
+                            + (" ..." if len(uniq) > 20 else ""))
+
+        # \u2500\u2500 Sub-tab 2: Value labels editor \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        with lab_sub_val:
+            st.caption("Zmie\u0144 wy\u015bwietlane etykiety warto\u015bci dla wybranej zmiennej.")
+            col_vv1, col_vv2 = st.columns([1, 1])
+            with col_vv1:
+                val_edit_var = st.selectbox("Zmienna:", df_raw.columns,
+                    format_func=lambda x: f"[{x}] {var_labels.get(x, x)}",
+                    key="lab_val_edit_var")
+                spss_codes = meta_orig.variable_value_labels.get(val_edit_var, {})
+                raw_vals   = sorted(df_raw[val_edit_var].dropna().unique())
+                st.caption(f"{len(raw_vals)} unikalnych warto\u015bci \u00b7 {len(spss_codes)} etykiet \u017ar\u00f3d\u0142owych")
+                display_items = {}
+                for v in raw_vals:
+                    raw_str = str(v)
+                    spss_lbl = spss_codes.get(v, spss_codes.get(raw_str, ''))
+                    display_items[raw_str] = spss_lbl if spss_lbl else raw_str
+                if len(display_items) > 50:
+                    st.warning(f"Wy\u015bwietlono pierwsze 50 z {len(display_items)} warto\u015bci.")
+                    display_items = dict(list(display_items.items())[:50])
+            with col_vv2:
+                st.markdown("**Nowe etykiety wy\u015bwietlania:**")
+                existing_custom = st.session_state.custom_val_labels.get(val_edit_var, {})
+                new_val_map = {}
+                for raw_str, spss_lbl in display_items.items():
+                    current = existing_custom.get(raw_str, spss_lbl)
+                    hint = f" [{spss_lbl}]" if spss_lbl and spss_lbl != raw_str else ""
+                    new_label = st.text_input(f"Kod {raw_str}{hint}:", value=current,
+                        key=f"lab_vl_{val_edit_var}_{raw_str}")
+                    new_val_map[raw_str] = new_label
+                col_bsave, col_bclear = st.columns(2)
+                with col_bsave:
+                    if st.button("\U0001f4be Zapisz etykiety warto\u015bci", key="lab_save_val_lbls",
+                                 use_container_width=True, type="primary"):
+                        filtered = {k: v for k, v in new_val_map.items()
+                                    if v.strip() and v.strip() != k}
+                        st.session_state.custom_val_labels[val_edit_var] = filtered
+                        st.session_state.user_cleared_val_labels.discard(val_edit_var)
+                        st.success(f"Zapisano {len(filtered)} etykiet dla `{val_edit_var}`.")
+                        st.rerun()
+                with col_bclear:
+                    if existing_custom and st.button("\U0001f5d1\ufe0f Usu\u0144",
+                                                     key="lab_clear_val_lbls",
+                                                     use_container_width=True):
+                        st.session_state.custom_val_labels.pop(val_edit_var, None)
+                        st.session_state.user_cleared_val_labels.add(val_edit_var)
+                        st.rerun()
+
+            # \u2500\u2500 Saved labels for current variable \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+            all_saved = st.session_state.custom_val_labels
+            if all_saved:
+                st.divider()
+                st.markdown("**\U0001f4cb Zapisane etykiety warto\u015bci (wszystkie zmienne):**")
+                for sv_col, sv_map in list(all_saved.items()):
+                    with st.expander(
+                        f"`{sv_col}` \u2014 {var_labels.get(sv_col, sv_col)} ({len(sv_map)} etykiet)",
+                        expanded=(sv_col == val_edit_var)
+                    ):
+                        sv_edited = {}
+                        for code, lbl in sorted(sv_map.items(), key=lambda x: x[0]):
+                            ec1, ec2, ec3 = st.columns([1, 4, 1])
+                            ec1.markdown(f"**{code}**")
+                            new_v = ec2.text_input("", value=str(lbl),
+                                key=f"sv_val_{sv_col}_{code}",
+                                label_visibility="collapsed")
+                            sv_edited[code] = new_v
+                            with ec3:
+                                if st.button("\U0001f5d1\ufe0f", key=f"sv_del_row_{sv_col}_{code}"):
+                                    upd = {k: v for k, v in sv_map.items() if str(k) != str(code)}
+                                    if upd:
+                                        st.session_state.custom_val_labels[sv_col] = upd
+                                    else:
+                                        st.session_state.custom_val_labels.pop(sv_col, None)
+                                        st.session_state.user_cleared_val_labels.add(sv_col)
+                                    st.rerun()
+                        sc1, sc2 = st.columns(2)
+                        with sc1:
+                            if st.button("\U0001f4be Zapisz", key=f"sv_save_{sv_col}",
+                                         use_container_width=True):
+                                st.session_state.custom_val_labels[sv_col] = sv_edited
+                                st.success("Zapisano.")
+                                st.rerun()
+                        with sc2:
+                            if st.button("\U0001f5d1\ufe0f Usu\u0144 ca\u0142\u0105 zmienn\u0105",
+                                         key=f"sv_del_{sv_col}", use_container_width=True):
+                                st.session_state.custom_val_labels.pop(sv_col, None)
+                                st.session_state.user_cleared_val_labels.add(sv_col)
+                                st.rerun()
+
+        # \u2500\u2500 Sub-tab 3: All custom labels overview \u2500\u2500\u2500\u2500\u2500
+        with lab_sub_all:
+            has_any = st.session_state.custom_var_labels or st.session_state.custom_val_labels
+            if not has_any:
+                st.info("Nie wprowadzono \u017cadnych niestandardowych etykiet.")
+            else:
+                if st.session_state.custom_var_labels:
+                    st.markdown("**\u270f\ufe0f Zmienione etykiety zmiennych:**")
+                    changed_var = False
+                    for col_cv, lbl_cv in list(st.session_state.custom_var_labels.items()):
+                        rc1, rc2, rc3 = st.columns([3, 3, 1])
+                        rc1.markdown(f"`{col_cv}`")
+                        new_cv = rc2.text_input("", value=lbl_cv,
+                            key=f"all_var_lbl_{col_cv}", label_visibility="collapsed")
+                        with rc3:
+                            if st.button("\U0001f5d1\ufe0f", key=f"all_del_var_{col_cv}"):
+                                st.session_state.custom_var_labels.pop(col_cv, None)
+                                st.rerun()
+                        if new_cv != lbl_cv:
+                            st.session_state.custom_var_labels[col_cv] = new_cv
+                            changed_var = True
+                    st.divider()
+
+                if st.session_state.custom_val_labels:
+                    st.markdown("**\U0001f3f7\ufe0f Zmienione etykiety warto\u015bci:**")
+                    for col_cv, val_map in list(st.session_state.custom_val_labels.items()):
+                        with st.expander(
+                            f"`{col_cv}` \u2014 {var_labels.get(col_cv, col_cv)}"
+                            f" ({len(val_map)} etykiet)", expanded=False
+                        ):
+                            edited_vmap = {}
+                            for code, lbl in sorted(val_map.items(), key=lambda x: x[0]):
+                                ec1, ec2 = st.columns([1, 3])
+                                ec1.markdown(f"Kod **{code}**")
+                                new_v = ec2.text_input("", value=str(lbl),
+                                    key=f"all_val_{col_cv}_{code}",
+                                    label_visibility="collapsed")
+                                edited_vmap[code] = new_v
+                            sc1, sc2 = st.columns(2)
+                            with sc1:
+                                if st.button("\U0001f4be Zapisz", key=f"all_save_val_{col_cv}",
+                                             use_container_width=True):
+                                    st.session_state.custom_val_labels[col_cv] = edited_vmap
+                                    st.session_state.user_cleared_val_labels.discard(col_cv)
+                                    st.success("Zapisano.")
+                                    st.rerun()
+                            with sc2:
+                                if st.button("\U0001f5d1\ufe0f Usu\u0144",
+                                             key=f"all_del_val_{col_cv}",
+                                             use_container_width=True):
+                                    st.session_state.custom_val_labels.pop(col_cv, None)
+                                    st.session_state.user_cleared_val_labels.add(col_cv)
+                                    st.rerun()
+
+            st.divider()
+            if st.button("\U0001f5d1\ufe0f Usu\u0144 WSZYSTKIE moje etykiety",
+                         type="secondary", use_container_width=True, key="all_del_all_labels"):
+                _all_val_cols = set(st.session_state.custom_val_labels.keys())
+                st.session_state.custom_var_labels = {}
+                st.session_state.custom_val_labels = {}
+                st.session_state.user_cleared_val_labels = _all_val_cols
                 st.rerun()
 
     # -- CZYSZCZENIE DANYCH -------------------------
@@ -3158,15 +3378,16 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
             )
 
             type_rows = []
+            _type_label = {"numeric": "numeryczna", "categorical": "kategoryczna", "auto": "auto"}
             for col in df_orig_raw.columns:
                 auto_type = "numeryczna" if col in numeric_cols_raw else "kategoryczna"
                 override  = st.session_state.excel_col_types.get(col, "auto")
-                effective = auto_type if override == "auto" else override
+                effective = auto_type if override == "auto" else _type_label.get(override, override)
                 type_rows.append({
                     "Zmienna": col,
                     "Etykieta": var_labels.get(col, col),
                     "Auto-detekcja": auto_type,
-                    "Korekta u\u017cytkownika": override,
+                    "Korekta u\u017cytkownika": _type_label.get(override, override),
                     "Efektywny typ": effective,
                     "Unikalnych warto\u015bci": df_orig_raw[col].nunique(),
                     "Brak\u00f3w [N]": df_orig_raw[col].isna().sum(),
@@ -3185,8 +3406,9 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
             with col_t2:
                 cur_override = st.session_state.excel_col_types.get(type_edit_var, "auto")
                 new_type = st.selectbox(
-                    "Typ:", ["auto", "numeryczna", "kategoryczna"],
-                    index=["auto", "numeryczna", "kategoryczna"].index(cur_override),
+                    "Typ:", ["auto", "numeric", "categorical"],
+                    format_func=lambda x: {"auto": "auto", "numeric": "numeryczna", "categorical": "kategoryczna"}[x],
+                    index=["auto", "numeric", "categorical"].index(cur_override) if cur_override in ["auto", "numeric", "categorical"] else 0,
                     key="type_edit_val"
                 )
             with col_t3:
@@ -3197,7 +3419,6 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
                         st.session_state.excel_col_types.pop(type_edit_var, None)
                     else:
                         st.session_state.excel_col_types[type_edit_var] = new_type
-                    # Clear cache so file is re-read with new types
                     load_excel_data.clear()
                     st.success(f"Typ `{type_edit_var}` zmieniony na **{new_type}**. Strona zostanie od\u015bwie\u017cona.")
                     st.rerun()
@@ -3207,6 +3428,40 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
                     st.session_state.excel_col_types = {}
                     load_excel_data.clear()
                     st.rerun()
+
+            # \u2500\u2500 Summary of converted variables \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+            numeric_overrides = {c: v for c, v in st.session_state.excel_col_types.items()
+                                 if v == "numeric"}
+            if numeric_overrides:
+                st.divider()
+                st.markdown("**\u2705 Zmienne zmienione na numeryczne:**")
+                for col_n in numeric_overrides:
+                    val_lbl = st.session_state.custom_val_labels.get(col_n, {})
+                    tag = " \u2014 zakodowana tekstowo" if val_lbl else " \u2014 by\u0142a ju\u017c liczbowa"
+                    with st.expander(f"**{var_labels.get(col_n, col_n)}** (`{col_n}`){tag}", expanded=False):
+                        if val_lbl:
+                            st.markdown("**Etykiety warto\u015bci** (mo\u017cesz edytowa\u0107):")
+                            edited_labels = {}
+                            for code, lbl in sorted(val_lbl.items(), key=lambda x: x[0]):
+                                new_lbl = st.text_input(
+                                    f"Kod {code}:",
+                                    value=str(lbl),
+                                    key=f"lbl_edit_{col_n}_{code}"
+                                )
+                                edited_labels[code] = new_lbl
+                            if st.button("\U0001f4be Zapisz etykiety", key=f"lbl_save_{col_n}",
+                                         use_container_width=True):
+                                st.session_state.custom_val_labels[col_n] = edited_labels
+                                st.success("Etykiety zapisane.")
+                                st.rerun()
+                        else:
+                            st.info("Warto\u015bci by\u0142y ju\u017c liczbowe \u2014 brak etykiet do edycji.")
+                        if st.button("\u21a9\ufe0f Cofnij zmian\u0119 typu", key=f"type_revert_{col_n}",
+                                     use_container_width=True):
+                            st.session_state.excel_col_types.pop(col_n, None)
+                            st.session_state.custom_val_labels.pop(col_n, None)
+                            load_excel_data.clear()
+                            st.rerun()
 
     # -- MRS ------------------------------------------
     with tab_mrs:
