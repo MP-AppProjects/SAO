@@ -2643,7 +2643,8 @@ elif menu == "\U0001f4c1 Projekt i S\u0142ownik":
             )
             n_config = (len(st.session_state.mrs_sets) + len(st.session_state.matrix_sets) +
                         len(st.session_state.recodings) + len(st.session_state.segmentations) +
-                        len(st.session_state.custom_var_labels) + len(st.session_state.custom_missing))
+                        len(st.session_state.custom_var_labels) + len(st.session_state.custom_missing) +
+                        sum(len(v) for v in st.session_state.box_sets.values()))
             st.caption(f"Konfiguracja: {n_config} element\u00f3w | Analizy: {n_analyses} modu\u0142\u00f3w z wynikami")
 
         # \u2500\u2500 LOAD \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -2810,13 +2811,13 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
         tab_miss, tab_labels, tab_types, tab_clean, tab_mrs, tab_matrix, tab_weight, tab_recode, tab_box = st.tabs([
             "\u26a0\ufe0f Braki", "\U0001f3f7\ufe0f Etykiety", "\U0001f522 Typy", "\U0001f9f9 Czyszczenie",
             "\U0001f5f9 Wielokrotne odp.", "\U0001f4cb Matrycowe",
-            "\u2696\ufe0f Wa\u017cenie", "\U0001f504 Rekodowanie", "\U0001f4e6 Top/Bottom Box"
+            "\u2696\ufe0f Wa\u017cenie", "\U0001f504 Rekodowanie", "\U0001f4e6 Grupowanie odpowiedzi"
         ])
     else:
         tab_miss, tab_labels, tab_clean, tab_mrs, tab_matrix, tab_weight, tab_recode, tab_box = st.tabs([
             "\u26a0\ufe0f Braki", "\U0001f3f7\ufe0f Etykiety", "\U0001f9f9 Czyszczenie",
             "\U0001f5f9 Wielokrotne odp.", "\U0001f4cb Matrycowe",
-            "\u2696\ufe0f Wa\u017cenie", "\U0001f504 Rekodowanie", "\U0001f4e6 Top/Bottom Box"
+            "\u2696\ufe0f Wa\u017cenie", "\U0001f504 Rekodowanie", "\U0001f4e6 Grupowanie odpowiedzi"
         ])
         tab_types = None
 
@@ -2981,15 +2982,63 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
 
         if st.session_state.recodings:
             st.divider()
-            st.markdown("**Zapisane rekodowania:**")
+            st.markdown(f"**Zapisane rekodowania ({len(st.session_state.recodings)}):**")
             to_del = None
             for i, rec in enumerate(st.session_state.recodings):
-                c1, c2 = st.columns([5, 1])
-                c1.markdown(f"- `{rec['new_name']}` \u2190 `{rec['source']}` \u00b7 *{rec['label']}* \u00b7 typ wyj\u015bcia: `{rec.get('output_type','auto')}`")
-                if c2.button("\U0001f5d1\ufe0f", key=f"del_rec_{i}"):
-                    to_del = i
+                src_v   = rec['source']
+                new_v   = rec['new_name']
+                lbl_v   = rec.get('label', '')
+                out_t   = rec.get('output_type', 'auto')
+                mapping = rec.get('mapping', {})
+                with st.expander(
+                    f"`{new_v}` \u2190 `{src_v}` \u00b7 {lbl_v or '(brak etykiety)'}",
+                    expanded=False
+                ):
+                    # Editable fields
+                    e1, e2 = st.columns(2)
+                    new_lbl_r = e1.text_input("Etykieta:", value=lbl_v, key=f"rec_lbl_{i}")
+                    new_name_r = e2.text_input("Nazwa zmiennej:", value=new_v, key=f"rec_nm_{i}")
+
+                    if mapping:
+                        st.markdown("**Mapa kodowania:**")
+                        for old_k, new_k in mapping.items():
+                            mc1, mc2 = st.columns(2)
+                            mc1.markdown(f"`{old_k}` \u2192")
+                            mc2.text_input("", value=str(new_k),
+                                key=f"rec_map_{i}_{old_k}",
+                                label_visibility="collapsed")
+
+                    bc1, bc2 = st.columns(2)
+                    with bc1:
+                        if st.button("\U0001f4be Zapisz zmiany", key=f"rec_save_{i}",
+                                     use_container_width=True):
+                            st.session_state.recodings[i]['label']    = new_lbl_r
+                            st.session_state.recodings[i]['new_name'] = new_name_r
+                            # Update mapping if editable
+                            if mapping:
+                                updated_map = {}
+                                for old_k in mapping:
+                                    raw_new = st.session_state.get(f"rec_map_{i}_{old_k}", str(mapping[old_k]))
+                                    # Try to cast to original type
+                                    try:
+                                        raw_new = float(raw_new) if '.' in str(raw_new) else int(raw_new)
+                                    except (ValueError, TypeError):
+                                        pass
+                                    updated_map[old_k] = raw_new
+                                st.session_state.recodings[i]['mapping'] = updated_map
+                            st.success("Zapisano.")
+                            st.rerun()
+                    with bc2:
+                        if st.button("\U0001f5d1\ufe0f Usu\u0144 rekodowanie", key=f"rec_del_{i}",
+                                     use_container_width=True):
+                            to_del = i
             if to_del is not None:
                 st.session_state.recodings.pop(to_del)
+                st.rerun()
+
+            if st.button("\U0001f5d1\ufe0f Usu\u0144 wszystkie rekodowania", type="secondary",
+                         use_container_width=True, key="rec_del_all"):
+                st.session_state.recodings = []
                 st.rerun()
 
     # -- ETYKIETY ZMIENNYCH I WARTOSCI ----------------
@@ -3653,7 +3702,7 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
     with tab_box:
         col1, col2 = st.columns([1, 1])
         with col1:
-            st.markdown("#### Dodaj grup\u0119 (Top/Bottom Box)")
+            st.markdown("#### Dodaj grup\u0119 (np. Top/Bottom Box)")
             box_var = st.selectbox("Zmienna:", visible_columns, format_func=lambda x: get_var_display_name(x, var_labels), key="box_var_select")
             if box_var:
                 box_name = st.text_input("Nazwa grupy (np. Top 2 Box):")
@@ -3667,23 +3716,105 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
             st.markdown("#### Zdefiniowane grupy")
             if not st.session_state.box_sets:
                 st.info("Brak grup Box.")
-            to_del_v, to_del_b = None, None
-            for var, boxes in st.session_state.box_sets.items():
-                st.markdown(f"**{var}**")
-                for b_name, b_cats in boxes.items():
-                    c1, c2 = st.columns([4, 1])
-                    c1.write(f"- {b_name}: {', '.join(str(c) for c in b_cats)}")
-                    if c2.button("\U0001f5d1\ufe0f", key=f"del_box_{var}_{b_name}"): to_del_v, to_del_b = var, b_name
-            if to_del_v:
-                del st.session_state.box_sets[to_del_v][to_del_b]
-                if not st.session_state.box_sets[to_del_v]: del st.session_state.box_sets[to_del_v]
-                st.rerun()
+            for var, boxes in list(st.session_state.box_sets.items()):
+                with st.expander(
+                    f"**{var_labels.get(var, var)}** (`{var}`) \u2014 {len(boxes)} grup",
+                    expanded=False
+                ):
+                    all_cats = list(df[var].dropna().unique())
+                    to_del_b = None
+                    for b_name, b_cats in list(boxes.items()):
+                        st.markdown(f"**{b_name}**")
+                        new_cats = st.multiselect(
+                            f"Odpowiedzi w grupie {b_name}:",
+                            options=all_cats,
+                            default=[c for c in b_cats if c in all_cats],
+                            key=f"box_edit_{var}_{b_name}"
+                        )
+                        sc1, sc2 = st.columns(2)
+                        with sc1:
+                            if st.button(f"\U0001f4be Zapisz {b_name}",
+                                         key=f"save_box_{var}_{b_name}",
+                                         use_container_width=True):
+                                if new_cats:
+                                    st.session_state.box_sets[var][b_name] = new_cats
+                                    st.success("Zapisano.")
+                                    st.rerun()
+                                else:
+                                    st.error("Wybierz co najmniej jedn\u0105 odpowied\u017a.")
+                        with sc2:
+                            if st.button(f"\U0001f5d1\ufe0f Usu\u0144 {b_name}",
+                                         key=f"del_box_{var}_{b_name}",
+                                         use_container_width=True):
+                                to_del_b = b_name
+
+                    if to_del_b:
+                        del st.session_state.box_sets[var][to_del_b]
+                        if not st.session_state.box_sets[var]:
+                            del st.session_state.box_sets[var]
+                        st.rerun()
+
+                    st.divider()
+                    if st.button(f"\U0001f5d1\ufe0f Usu\u0144 wszystkie grupy dla tej zmiennej",
+                                 key=f"del_box_var_{var}", use_container_width=True):
+                        del st.session_state.box_sets[var]
+                        st.rerun()
 
     # -- SEGMENTACJA -----------------------------------
     # -- WAZENIE ---------------------------------------
     with tab_weight:
         st.markdown("#### Wa\u017cenie RIM (iteracyjne dopasowanie proporcjonalne)")
-        weight_vars = st.multiselect("Zmienne do wa\u017cenia:", visible_columns, format_func=lambda x: get_var_display_name(x, var_labels))
+
+        # \u2500\u2500 Active weights summary \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        if st.session_state.weights is not None:
+            w_arr = st.session_state.weights
+            wc1, wc2, wc3 = st.columns(3)
+            wc1.metric("N obserwacji", len(w_arr))
+            wc2.metric("Min waga", f"{w_arr.min():.4f}")
+            wc3.metric("Max waga", f"{w_arr.max():.4f}")
+
+            if st.session_state.weight_targets:
+                with st.expander("\U0001f4cb Aktualne cele wa\u017cenia (kliknij aby zobaczy\u0107 / zmodyfikowa\u0107)", expanded=False):
+                    st.caption("Poni\u017cej mo\u017cesz zmieni\u0107 docelowe odsetki i przelicy\u0107 wagi.")
+                    mod_targets = {}
+                    mod_valid = True
+                    for wv, wt in st.session_state.weight_targets.items():
+                        st.markdown(f"**{get_var_display_name(wv, var_labels)}**")
+                        mod_targets[wv] = {}
+                        cats_w = list(wt.keys())
+                        w_cols = st.columns(min(len(cats_w), 4))
+                        sum_w = 0.0
+                        for i, cat in enumerate(cats_w):
+                            cur_pct = round(wt[cat] * 100, 1)
+                            new_pct = w_cols[i % 4].number_input(
+                                f"{cat}", 0.0, 100.0, cur_pct,
+                                key=f"wmod_{wv}_{cat}"
+                            )
+                            mod_targets[wv][cat] = new_pct / 100.0
+                            sum_w += new_pct
+                        if not np.isclose(sum_w, 100.0, atol=0.1):
+                            st.error(f"{get_var_display_name(wv, var_labels)}: suma = {sum_w:.1f}% (wymagane 100%)")
+                            mod_valid = False
+                    if mod_valid and st.button("\u2696\ufe0f Przelicz wagi z nowymi celami", type="primary",
+                                               key="reweight_btn"):
+                        st.session_state.weights = calculate_rim_weights(df, mod_targets)
+                        st.session_state.weight_targets = mod_targets
+                        st.success("\u2705 Wagi przeliczone!")
+                        st.rerun()
+
+            if st.button("\U0001f5d1\ufe0f Usu\u0144 wagi", type="secondary", key="del_weights",
+                         use_container_width=False):
+                st.session_state.weights = None
+                st.session_state.weight_targets = {}
+                st.success("\u2705 Wagi usuni\u0119te.")
+                st.rerun()
+
+            st.divider()
+            st.markdown("**Przelicz wagi od nowa (nowe zmienne / cele):**")
+
+        weight_vars = st.multiselect("Zmienne do wa\u017cenia:", visible_columns,
+                                      format_func=lambda x: get_var_display_name(x, var_labels),
+                                      key="weight_vars_sel")
         if weight_vars:
             st.write("Wprowad\u017a docelowe odsetki (suma musi wynosi\u0107 100%):")
             targets, valid_targets = {}, True
@@ -3700,10 +3831,11 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
                 if not np.isclose(sum_pct, 100.0, atol=0.1):
                     st.error(f"Suma = {sum_pct:.1f}%. Musi wynosi\u0107 100%!")
                     valid_targets = False
-            if valid_targets and st.button("\u2696\ufe0f Oblicz wagi", type="primary"):
+            if valid_targets and st.button("\u2696\ufe0f Oblicz wagi", type="primary", key="calc_weights"):
                 st.session_state.weights = calculate_rim_weights(df, targets)
                 st.session_state.weight_targets = targets
                 st.success("\u2705 Wagi obliczone!")
+                st.rerun()
 
 # -------------------------------------------------------------
 # MODU? 3: ANALIZY I TABELE
