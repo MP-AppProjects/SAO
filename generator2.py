@@ -4287,7 +4287,7 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
                 if corr_method == 'pearson' and _w_corr is not None:
                     # Reconstruct numeric matrix from the starred corr_df
                     import re as _re
-                    num_corr = corr_df.applymap(
+                    num_corr = corr_df.map(
                         lambda x: float(_re.sub(r'[*\n].*', '', str(x))) if str(x) not in ('1.000', 'N/A') else (1.0 if str(x) == '1.000' else np.nan)
                     )
                 else:
@@ -4304,7 +4304,7 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
                 # \u2500\u2500 Color-coded table \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
                 _color_corr_cell = _make_color_corr_cell(corr_threshold)
 
-                styled = corr_df.style.applymap(_color_corr_cell).format(
+                styled = corr_df.style.map(_color_corr_cell).format(
                     lambda x: x if isinstance(x, str) else f'{x:.3f}'
                 )
                 st.dataframe(styled, use_container_width=True)
