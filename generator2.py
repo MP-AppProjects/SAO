@@ -354,34 +354,27 @@ def apply_segmentations(df_raw, df, meta_labels, segmentations_list):
         meta_labels[name] = f"Segmentacja K-Means ({k} grup)"
 
 def apply_recodings(df_raw, df, var_labels, recodings_list):
-    """Apply variable recodings stored in session state.
-    Supports both numeric and text source variables.
-    Output type is determined by the mapped values (numeric if all parseable, else text).
-    """
+    """Apply variable recodings stored in session state."""
+    import streamlit as _st
+    _cvar = _st.session_state.get('custom_var_labels', {})
     for rec in recodings_list:
         src = rec['source']
         new_name = rec['new_name']
-        mapping = rec['mapping']   # {old_val_str: new_val_str}
+        mapping = rec['mapping']
         label = rec.get('label', new_name)
-        output_type = rec.get('output_type', 'auto')  # 'numeric', 'text', 'auto'
+        output_type = rec.get('output_type', 'auto')
         if src not in df_raw.columns:
             continue
-
         src_series = df_raw[src].copy().astype(str).str.strip()
-
-        # Build a normalised lookup: str(old_val) -> new_val_str
         lookup = {str(k).strip(): str(v) for k, v in mapping.items()}
-
-        new_col = src_series.map(lookup)   # unmapped ? NaN
-
-        # Decide output type
+        new_col = src_series.map(lookup)
         if output_type == 'numeric':
             df_raw[new_name] = pd.to_numeric(new_col, errors='coerce')
             df[new_name] = df_raw[new_name].copy()
         elif output_type == 'text':
             df_raw[new_name] = new_col
             df[new_name] = new_col
-        else:  # auto: numeric if all non-null values are parseable
+        else:
             numeric_attempt = pd.to_numeric(new_col, errors='coerce')
             if new_col.dropna().empty or numeric_attempt.notna().sum() == new_col.notna().sum():
                 df_raw[new_name] = numeric_attempt
@@ -389,8 +382,7 @@ def apply_recodings(df_raw, df, var_labels, recodings_list):
             else:
                 df_raw[new_name] = new_col
                 df[new_name] = new_col
-
-        var_labels[new_name] = label
+        var_labels[new_name] = _cvar.get(new_name, label)
 
 def apply_cleaning_ops(df_raw, df, cleaning_ops_list):
     """
@@ -2166,36 +2158,42 @@ if st.session_state.treat_empty_as_miss:
 # Apply custom missing values
 for c, m_vals in st.session_state.custom_missing.items():
     if c in df_raw.columns:
-        # Build a comprehensive replace list:
-        # - original values (numeric)
-        # - string versions: "999", "999.0"  (for object/text columns)
-        # - int versions: 999 (for columns stored as int64)
+        # Build replace list \u2014 include value as-is plus numeric variants
         replace_vals = []
         for v in m_vals:
             replace_vals.append(v)
             try:
-                iv = int(v)
+                iv = int(float(v))
                 replace_vals.append(iv)
-                replace_vals.append(str(iv))          # "999"
+                replace_vals.append(str(iv))
             except (ValueError, TypeError):
                 pass
             try:
-                replace_vals.append(str(v))           # "999.0"
+                replace_vals.append(str(v))
                 replace_vals.append(str(float(v)))
             except (ValueError, TypeError):
                 pass
-        replace_vals = list(dict.fromkeys(replace_vals))  # deduplicate, preserve order
+        replace_vals = list(dict.fromkeys(replace_vals))
 
+        # Convert Categorical to object before replace (required for text columns)
+        if hasattr(df_raw[c], 'cat'):
+            df_raw[c] = df_raw[c].astype(object)
         df_raw[c] = df_raw[c].replace(replace_vals, np.nan)
+
         if is_spss:
-            # Also replace value-labelled versions in df
-            label_vals = [
-                meta_orig.variable_value_labels.get(c, {}).get(v)
-                for v in m_vals
-                if v in meta_orig.variable_value_labels.get(c, {})
-            ]
+            # For SPSS: replace both numeric codes and their labels in df
+            label_vals = []
+            _vvl = meta_orig.variable_value_labels.get(c, {})
+            for v in m_vals:
+                lbl = _vvl.get(v, _vvl.get(str(v), None))
+                if lbl is not None:
+                    label_vals.append(lbl)
+            if hasattr(df[c], 'cat'):
+                df[c] = df[c].astype(object)
             df[c] = df[c].replace(label_vals + replace_vals, np.nan)
         else:
+            if hasattr(df[c], 'cat'):
+                df[c] = df[c].astype(object)
             df[c] = df[c].replace(replace_vals, np.nan)
 
 hidden_cols = set()
@@ -3040,7 +3038,6 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
                          use_container_width=True, key="rec_del_all"):
                 st.session_state.recodings = []
                 st.rerun()
-
     # -- ETYKIETY ZMIENNYCH I WARTOSCI ----------------
     with tab_labels:
         st.markdown("#### \U0001f3f7\ufe0f Etykiety zmiennych i warto\u015bci")
@@ -3891,9 +3888,15 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
                     res_df.loc['Braki danych'] = [missing_count, np.nan]
                 else:
                     missing_mask = df[freq_var].isna()
-                    missing_count = w[missing_mask].sum()
                     valid_df = pd.DataFrame({'val': df[freq_var], 'w': w}).dropna()
                     counts = valid_df.groupby('val', observed=False)['w'].sum()
+
+                    # Apply custom value labels to rename index (e.g. 1\u2192Kobieta)
+                    _cvl_freq = st.session_state.custom_val_labels.get(freq_var, {})
+                    if _cvl_freq:
+                        counts.index = counts.index.map(
+                            lambda x: _cvl_freq.get(str(x), _cvl_freq.get(x, x))
+                        )
                     if freq_var in st.session_state.box_sets:
                         for box_name, b_cats in st.session_state.box_sets[freq_var].items():
                             box_val = counts[counts.index.isin(b_cats)].sum()
@@ -3902,6 +3905,8 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
                     res_df = pd.DataFrame({'Liczebnosc [N]': counts, 'Procent [%]': pcts})
                     sum_n = counts[~counts.index.astype(str).str.startswith('[')].sum()
                     res_df.loc['Suma'] = [sum_n, 100.0 if sum_n > 0 else 0]
+
+                    missing_count = w[missing_mask].sum()
                     res_df.loc['Braki danych'] = [missing_count, np.nan]
                 st.session_state.results['czestosci'][freq_var] = res_df
                 with st.expander(get_var_display_name(freq_var, var_labels), expanded=True):
