@@ -215,20 +215,101 @@ def auto_detect_mrs(df_raw):
     return {k: v for k, v in mrs_candidates.items() if len(v) > 1}
 
 def auto_detect_matrix(df_raw):
-    """Detect matrix/battery questions by shared prefix -- works for numeric AND text columns."""
-    binary_cols = set(c for c in df_raw.columns if set(df_raw[c].dropna().unique()).issubset({0, 1}))
-    # All non-binary columns (numeric and text)
+    """
+    Detect matrix/battery questions using two signals combined:
+      1. Shared variable-name prefix (Q1_1, Q1_2... or Q1a, Q1b...)
+      2. Compatible value set \u2014 subquestions share a scale, but tolerate
+         missing categories (e.g. if Q1_3 respondents never picked '5'
+         the column still belongs to the same matrix).
+
+    Returns dict {battery_name: [sorted columns...]} with >=2 subquestions.
+    """
+    import re
+    binary_cols = set(c for c in df_raw.columns
+                      if set(df_raw[c].dropna().unique()).issubset({0, 1}))
     candidates = [c for c in df_raw.columns if c not in binary_cols]
-    matrix_candidates = defaultdict(list)
+
+    def _extract_prefix(col):
+        s = str(col).strip()
+        m = re.match(r"^(.+?)[_.\-](\w+)$", s)
+        if m:
+            prefix, suffix = m.group(1), m.group(2)
+            if suffix.isdigit() or (len(suffix) <= 3 and re.match(r"^[a-zA-Z0-9]+$", suffix)):
+                return prefix
+        m = re.match(r"^(.+?)(\d+)$", s)
+        if m and len(m.group(1)) >= 1:
+            return m.group(1)
+        m = re.match(r"^(.+?)([a-zA-Z])$", s)
+        if m and len(m.group(1)) >= 2:
+            return m.group(1)
+        return None
+
+    def _value_set(col_series):
+        return frozenset(col_series.dropna().unique())
+
+    def _compatible(cluster_union, candidate_set):
+        """Candidate belongs to cluster if its values are subset of cluster union,
+        OR overlap is >=60% of the smaller set (tolerates missing categories)."""
+        if not cluster_union or not candidate_set:
+            return False
+        # Perfect subset (candidate is a subset of cluster scale, with missing cats)
+        if candidate_set.issubset(cluster_union):
+            return True
+        # Cluster is itself a subset of candidate - candidate has all cluster vals + extras
+        if cluster_union.issubset(candidate_set):
+            return True
+        # Partial overlap test
+        inter = cluster_union & candidate_set
+        smaller = min(len(cluster_union), len(candidate_set))
+        return (len(inter) / smaller) >= 0.6
+
+    prefix_groups = defaultdict(list)
     for col in candidates:
-        if '_' in col:
-            prefix = col.rsplit('_', 1)[0]
-        elif len(col) > 1 and col[-1].isdigit():
-            prefix = col[:-1]
-        else:
+        p = _extract_prefix(col)
+        if p:
+            prefix_groups[p].append(col)
+
+    result = {}
+    for prefix, cols in prefix_groups.items():
+        if len(cols) < 2:
             continue
-        matrix_candidates[prefix].append(col)
-    return {k: sorted(v) for k, v in matrix_candidates.items() if len(v) >= 2}
+        col_sets = {}
+        for c in cols:
+            s = _value_set(df_raw[c])
+            if 2 <= len(s) <= 15:
+                col_sets[c] = s
+        if len(col_sets) < 2:
+            continue
+
+        # Greedy clustering: seed with largest value set (most complete scale),
+        # absorb compatible columns, update union, repeat
+        remaining = dict(col_sets)
+        clusters = []
+        while remaining:
+            seed = max(remaining.keys(), key=lambda c: len(remaining[c]))
+            seed_set = remaining.pop(seed)
+            cluster = [seed]
+            cluster_union = set(seed_set)
+            changed = True
+            while changed:
+                changed = False
+                for c in list(remaining.keys()):
+                    if _compatible(frozenset(cluster_union), remaining[c]):
+                        cluster.append(c)
+                        cluster_union |= remaining[c]
+                        remaining.pop(c)
+                        changed = True
+            if len(cluster) >= 2:
+                clusters.append(cluster)
+
+        if not clusters:
+            continue
+        if len(clusters) == 1:
+            result[prefix] = sorted(clusters[0])
+        else:
+            for i, cl in enumerate(clusters, 1):
+                result[f"{prefix}__{i}"] = sorted(cl)
+    return result
 
 def build_matrix_table(df, df_raw, matrix_cols, var_labels, weights, meta_vvl, custom_val_labels=None):
     """
@@ -383,6 +464,36 @@ def apply_recodings(df_raw, df, var_labels, recodings_list):
                 df_raw[new_name] = new_col
                 df[new_name] = new_col
         var_labels[new_name] = _cvar.get(new_name, label)
+
+def apply_hclust_columns(df_raw, df, var_labels, hclust_results):
+    """Re-apply stored hierarchical cluster columns to df_raw/df on every rerun.
+    Without this, cluster columns created by hclust disappear after a rerun
+    because df_raw is rebuilt from df_orig_raw each time.
+    Uses vectorized assignment for performance."""
+    for rec in hclust_results:
+        vname = rec.get('var_name')
+        labels_data = rec.get('labels_data', {})
+        if not vname or not labels_data:
+            continue
+        # Build a Series from labels_data with proper index types
+        # Try converting all keys to int first (row indexes usually are int)
+        try:
+            idx_converted = {int(k): v for k, v in labels_data.items()}
+        except (ValueError, TypeError):
+            idx_converted = labels_data
+        labels_series = pd.Series(idx_converted, dtype='float64')
+        # Filter to indices that exist in df_raw
+        labels_series = labels_series.reindex(df_raw.index.intersection(labels_series.index))
+        if labels_series.empty:
+            continue
+        # Vectorized assignment \u2014 one operation per dataframe
+        df_raw[vname] = labels_series.reindex(df_raw.index)
+        df[vname]     = labels_series.reindex(df.index).apply(
+            lambda x: f"Skupienie {int(x)}" if pd.notna(x) else np.nan
+        )
+        n_clusters = rec.get('n_clusters', '?')
+        method = rec.get('method', '?')
+        var_labels[vname] = f"Skupienia hierarchiczne ({n_clusters} grup, {method})"
 
 def apply_cleaning_ops(df_raw, df, cleaning_ops_list):
     """
@@ -540,12 +651,48 @@ def module_header(icon, title, subtitle=""):
 """, unsafe_allow_html=True)
 
 
+def _format_means_table(df):
+    """Format means-style table (index-based) with row-aware logic:
+       - 'Baza (N)' or 'N' row \u2192 integer (rounded for weighted N)
+       - Other numeric rows \u2192 2 decimal places"""
+    out = df.copy().astype(object)
+    for r_idx in out.index:
+        is_n_row = ("baza (n)" in str(r_idx).lower()
+                    or str(r_idx).strip().lower() == "n"
+                    or "liczebno" in str(r_idx).lower())
+        for c_idx in out.columns:
+            v = out.loc[r_idx, c_idx]
+            if pd.isna(v) or isinstance(v, str):
+                continue
+            try:
+                fv = float(v)
+                if is_n_row:
+                    out.loc[r_idx, c_idx] = f"{int(round(fv)):,}"
+                else:
+                    out.loc[r_idx, c_idx] = f"{fv:.2f}"
+            except (ValueError, TypeError):
+                pass
+    return out
+
 def get_streamlit_format(df):
     format_dict = {}
+    # Keywords that indicate a count/N column (always integer)
+    _n_keywords = ("[n]", "liczebno", "liczba", " n ", "_n_", "n_valid",
+                   "n_pair", "df", "stopni swobody", "observ")
     for col in df.columns:
         if df[col].apply(lambda x: isinstance(x, str) and ("%" in x or any(c.isalpha() for c in x if c not in ['N', 'a', 'A']))).any(): continue
-        if "%" in str(col).lower() or "procent" in str(col).lower():
+        col_str = str(col)
+        col_low = col_str.lower()
+        is_n_col = (
+            col_str in ("N", "Liczebnosc [N]", "Liczebno\u015b\u0107 [N]")
+            or "[N]" in col_str
+            or any(kw in col_low for kw in _n_keywords)
+            or col_low.startswith("n ") or col_low.endswith(" n") or col_low == "n"
+        )
+        if "%" in col_low or "procent" in col_low:
             format_dict[col] = lambda x: f"{x:.1f}%" if pd.notnull(x) and not isinstance(x, str) else str(x)
+        elif is_n_col:
+            format_dict[col] = lambda x: f"{round(x):.0f}" if pd.notnull(x) and not isinstance(x, str) else str(x)
         else:
             format_dict[col] = lambda x: f"{x:.2f}" if pd.notnull(x) and not isinstance(x, str) and abs(x - round(x)) > 0.01 else (f"{x:.0f}" if pd.notnull(x) and not isinstance(x, str) else str(x))
     return format_dict
@@ -687,7 +834,8 @@ def _make_style_md(n_rows):
     return _style
 
 def calculate_rim_weights(df, target_dict, max_iterations=50):
-    weights = np.ones(len(df))
+    n = len(df)
+    weights = np.ones(n)
     for iteration in range(max_iterations):
         max_error = 0
         for var, targets in target_dict.items():
@@ -700,6 +848,9 @@ def calculate_rim_weights(df, target_dict, max_iterations=50):
                     weights[mask] *= adjustment
                     max_error = max(max_error, abs(target_pct - current_pct))
         if max_error < 0.001: break
+    # Normalize so that sum(weights) == N (SPSS default behavior)
+    if weights.sum() > 0:
+        weights = weights * (n / weights.sum())
     return weights
 
 def calculate_correlations(df, cols, weights=None, method='pearson'):
@@ -902,7 +1053,7 @@ def run_anova(df_raw, dep_var, group_var, df_labeled, weights=None):
         std_g  = np.sqrt(var_g)
         desc_rows.append({
             'Grupa': g,
-            'N (wa\u017cone)': round(n_g, 2),
+            'N (wa\u017cone)': int(round(n_g)),
             'Srednia': round(mean_g, 4),
             'Odch. std.': round(std_g, 4),
             'Min': sub['dep'].min(),
@@ -1748,10 +1899,10 @@ def export_matrix_to_excel(writer, matrix_results, var_labels):
         row += 3   # gap between batteries
 
 
-def write_db_sheet(writer, sheet_label, data_df, var_labels, hdr_color='#1F4E79'):
+def write_db_sheet(writer, sheet_label, data_df, var_labels, hdr_color='#1F4E79', header_mode='names'):
     """Write a single database sheet into an already-open ExcelWriter.
     Row 0 = column names (header), data from row 1 onwards.
-    """
+    header_mode: 'names' (original col names) or 'labels' (var_labels)"""
     workbook = writer.book
     ws = workbook.add_worksheet(sheet_label[:31])
     fmt_h = workbook.add_format({
@@ -1759,7 +1910,11 @@ def write_db_sheet(writer, sheet_label, data_df, var_labels, hdr_color='#1F4E79'
         'border': 1, 'align': 'center',
     })
     for ci, col in enumerate(data_df.columns):
-        ws.write(0, ci, col, fmt_h)
+        if header_mode == 'labels':
+            header_text = var_labels.get(col, col) or col
+        else:
+            header_text = col
+        ws.write(0, ci, header_text, fmt_h)
         ws.set_column(ci, ci, 16)
     for ri, (_, row_data) in enumerate(data_df.iterrows()):
         for ci, val in enumerate(row_data):
@@ -1776,12 +1931,13 @@ def write_db_sheet(writer, sheet_label, data_df, var_labels, hdr_color='#1F4E79'
                 ws.write(ri + 1, ci, '' if s in ('nan', 'None', '<NA>') else s)
 
 
-def export_db_to_excel(df_raw, df_labeled, var_labels):
-    """Standalone download: both sheets in one file (kept for backward compat)."""
+def export_db_to_excel(df_raw, df_labeled, var_labels, header_mode='names'):
+    """Standalone download: both sheets in one file.
+    header_mode: 'names' or 'labels'"""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        write_db_sheet(writer, 'Baza z etykietami',        df_labeled, var_labels, '#1F4E79')
-        write_db_sheet(writer, 'Baza surowa (numeryczna)', df_raw,     var_labels, '#2E75B6')
+        write_db_sheet(writer, 'Baza z etykietami',        df_labeled, var_labels, '#1F4E79', header_mode)
+        write_db_sheet(writer, 'Baza surowa (numeryczna)', df_raw,     var_labels, '#2E75B6', header_mode)
     return output.getvalue()
 
 # -------------------------------------------------------------
@@ -1892,7 +2048,7 @@ def run_conjoint_cbc(df_raw, choice_var, attribute_vars):
     }, None
 
 
-def export_conjoint_to_excel(writer, conjoint_results, var_labels):
+def export_conjoint_to_excel(writer, conjoint_results, var_labels, meta_vvl=None, custom_val_labels=None):
     workbook = writer.book
     ws = workbook.add_worksheet('Conjoint')
     fmt_t  = workbook.add_format({'bold': True, 'bg_color': '#1F4E79', 'font_color': 'white',
@@ -1905,6 +2061,28 @@ def export_conjoint_to_excel(writer, conjoint_results, var_labels):
     fmt_str= workbook.add_format({'border': 1})
     ws.set_column(0, 0, 35)
     ws.set_column(1, 5, 16)
+
+    def _nice_level(attr, raw_lvl):
+        """Convert dummy-column name like 'Q1_A1' -> 'Q1_zdecydowanie'."""
+        s = str(raw_lvl)
+        prefix = f"{attr}_"
+        code_part = s[len(prefix):] if s.startswith(prefix) else s
+        _cvl = (custom_val_labels or {}).get(attr, {})
+        _vvl = (meta_vvl or {}).get(attr, {})
+        lbl_txt = _cvl.get(code_part, _cvl.get(str(code_part), ""))
+        if not lbl_txt:
+            for key_variant in (code_part, str(code_part)):
+                try:
+                    fv = float(key_variant)
+                    lbl_txt = _vvl.get(fv, _vvl.get(int(fv), ""))
+                    if lbl_txt:
+                        break
+                except (ValueError, TypeError):
+                    pass
+            if not lbl_txt:
+                lbl_txt = _vvl.get(code_part, "")
+        return f"{attr}_{lbl_txt}" if lbl_txt else s
+
     row = 0
     for res in conjoint_results:
         if res.get('error'):
@@ -1936,7 +2114,7 @@ def export_conjoint_to_excel(writer, conjoint_results, var_labels):
             ws.write(row, 0, f"[{attr}] {var_labels.get(attr, attr)}", fmt_lbl)
             ws.write(row, 1, "", fmt_str); row += 1
             for level, util in sorted(utils.items(), key=lambda x: -x[1]):
-                ws.write(row, 0, f"  {level}", fmt_str)
+                ws.write(row, 0, f"  {_nice_level(attr, level)}", fmt_str)
                 ws.write(row, 1, util, fmt_val); row += 1
         row += 3
 
@@ -2026,6 +2204,7 @@ if 'matrix_results'      not in st.session_state: st.session_state.matrix_result
 if 'custom_var_labels'   not in st.session_state: st.session_state.custom_var_labels = {}
 if 'custom_val_labels'   not in st.session_state: st.session_state.custom_val_labels = {}
 if 'user_cleared_val_labels' not in st.session_state: st.session_state.user_cleared_val_labels = set()
+if 'ppt_chart_templates'  not in st.session_state: st.session_state.ppt_chart_templates = {}
 if 'box_sets'            not in st.session_state: st.session_state.box_sets = defaultdict(dict)
 if 'segmentations'       not in st.session_state: st.session_state.segmentations = []
 if 'hclust_results'      not in st.session_state: st.session_state.hclust_results = []
@@ -2044,10 +2223,21 @@ if 'factor_results'      not in st.session_state: st.session_state.factor_result
 if 'reg_blocks'          not in st.session_state: st.session_state.reg_blocks = [[]]
 if 'conjoint_results'    not in st.session_state: st.session_state.conjoint_results = []
 if 'maxdiff_results'     not in st.session_state: st.session_state.maxdiff_results = []
+if 'normality_results'   not in st.session_state: st.session_state.normality_results = {}
 if 'maxdiff_pairs'       not in st.session_state: st.session_state.maxdiff_pairs = [('', '')]
 if 'data_source'         not in st.session_state: st.session_state.data_source = 'spss'
 if 'excel_col_types'     not in st.session_state: st.session_state.excel_col_types = {}
 if 'excel_sheet'         not in st.session_state: st.session_state.excel_sheet = None
+
+# \u2500\u2500 Helper: cumulative add/replace for list-based results \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+def _merge_result(results_list, new_entry, key_fn):
+    """Append new_entry or replace existing with same key. Mutates list in place."""
+    new_key = key_fn(new_entry)
+    for i, existing in enumerate(results_list):
+        if key_fn(existing) == new_key:
+            results_list[i] = new_entry
+            return
+    results_list.append(new_entry)
 
 # -------------------------------------------------------------
 # ?? Source selection ??????????????????????????????????????????
@@ -2144,6 +2334,7 @@ _pipeline_key = json.dumps({
 # Always apply \u2014 these are fast dict/pandas ops and run on copies not originals
 apply_segmentations(df_raw, df, var_labels, st.session_state.segmentations)
 apply_recodings(df_raw, df, var_labels, st.session_state.recodings)
+apply_hclust_columns(df_raw, df, var_labels, st.session_state.hclust_results)
 
 # Apply in-place text cleaning
 apply_cleaning_ops(df_raw, df, st.session_state.cleaning_ops)
@@ -2559,6 +2750,7 @@ elif menu == "\U0001f4c1 Projekt i S\u0142ownik":
                 "custom_var_labels":   st.session_state.custom_var_labels,
                 "custom_val_labels":   st.session_state.custom_val_labels,
                 "user_cleared_val_labels": list(st.session_state.user_cleared_val_labels),
+                "ppt_chart_templates": st.session_state.ppt_chart_templates,
                 "recodings":           st.session_state.recodings,
                 "cleaning_ops":        st.session_state.cleaning_ops,
                 "segmentations":       st.session_state.segmentations,
@@ -2700,6 +2892,7 @@ elif menu == "\U0001f4c1 Projekt i S\u0142ownik":
                         st.session_state.matrix_sets       = raw_data.get("matrix_sets", {})
                         st.session_state.custom_var_labels = raw_data.get("custom_var_labels", {})
                         st.session_state.custom_val_labels = raw_data.get("custom_val_labels", {})
+                        st.session_state.ppt_chart_templates = raw_data.get("ppt_chart_templates", {})
                         st.session_state.box_sets          = defaultdict(dict, raw_data.get("box_sets", {}))
                         st.session_state.segmentations     = raw_data.get("segmentations", [])
                         st.session_state.recodings         = raw_data.get("recodings", [])
@@ -3847,7 +4040,6 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
         freq_vars = st.multiselect("Wybierz zmienne:", all_options, format_func=lambda x: get_var_display_name(x, var_labels))
         show_charts_freq = st.checkbox("\U0001f4ca Wy\u015bwietlaj wykresy", key="charts_freq")
         if st.button("\u25b6\ufe0f Generuj tablice cz\u0119sto\u015bci", type="primary") and freq_vars:
-            st.session_state.results['czestosci'] = {}
             w = st.session_state.weights if use_weights else np.ones(len(df_raw))
             for freq_var in freq_vars:
                 if freq_var in st.session_state.matrix_sets:
@@ -3926,9 +4118,23 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
         # \u2500\u2500 Persistent display of stored results \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         if st.session_state.results.get('czestosci'):
             st.divider()
-            st.markdown(f"**Zapisane wyniki ({len(st.session_state.results['czestosci'])} tablic):**")
-            for freq_var, res_df in st.session_state.results['czestosci'].items():
-                with st.expander(get_var_display_name(freq_var, var_labels), expanded=False):
+            _fc1, _fc2 = st.columns([5, 1])
+            _fc1.markdown(f"**Zapisane wyniki ({len(st.session_state.results['czestosci'])} tablic):**")
+            with _fc2:
+                if st.button("\U0001f5d1\ufe0f Usu\u0144 wszystkie", key="del_all_freq",
+                             use_container_width=True):
+                    st.session_state.results['czestosci'] = {}
+                    st.rerun()
+            for freq_var, res_df in list(st.session_state.results['czestosci'].items()):
+                _ec1, _ec2 = st.columns([6, 1])
+                with _ec1:
+                    _exp = st.expander(get_var_display_name(freq_var, var_labels), expanded=False)
+                with _ec2:
+                    if st.button("\U0001f5d1\ufe0f", key=f"del_freq_{freq_var}",
+                                 help=f"Usu\u0144 wynik dla {freq_var}"):
+                        st.session_state.results['czestosci'].pop(freq_var, None)
+                        st.rerun()
+                with _exp:
                     st.dataframe(res_df.style.format(get_streamlit_format(res_df)),
                                  use_container_width=True)
                     if show_charts_freq:
@@ -3970,22 +4176,38 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
 
             if st.button("\u25b6\ufe0f Generuj tabele matrycowe", type="primary", key="gen_matrix"):
                 w = st.session_state.weights if use_weights else np.ones(len(df_raw))
-                st.session_state.matrix_results = []
                 for mat_name in mat_sel:
                     mat_cols = st.session_state.matrix_sets[mat_name]
                     try:
                         mat_df, cats, sub_lbls = build_matrix_table(df, df_raw, mat_cols, var_labels, w, meta_orig.variable_value_labels, st.session_state.custom_val_labels)
-                        st.session_state.matrix_results.append({
+                        _merge_result(st.session_state.matrix_results, {
                             'name': mat_name, 'df': mat_df, 'cats': cats,
                             'sub_labels': sub_lbls, 'cols': mat_cols,
                             'display_mode': mat_display_mode,
-                        })
+                        }, key_fn=lambda r: r['name'])
                     except Exception as e:
                         st.error(f"B\u0142\u0105d dla '{mat_name}': {e}")
                 st.success(f"\u2705 Wygenerowano {len(st.session_state.matrix_results)} tabel matrycowych.")
 
-            for entry in st.session_state.matrix_results:
-                with st.expander(f"\U0001f522 {entry['name']}", expanded=True):
+            if st.session_state.matrix_results:
+                _mrc1, _mrc2 = st.columns([5, 1])
+                _mrc1.markdown(f"**Zapisane tabele matrycowe ({len(st.session_state.matrix_results)}):**")
+                with _mrc2:
+                    if st.button("\U0001f5d1\ufe0f Usu\u0144 wszystkie", key="del_all_matrix",
+                                 use_container_width=True):
+                        st.session_state.matrix_results = []
+                        st.rerun()
+
+            for _mi, entry in enumerate(list(st.session_state.matrix_results)):
+                _mtc1, _mtc2 = st.columns([6, 1])
+                with _mtc1:
+                    _mtexp = st.expander(f"\U0001f522 {entry['name']}", expanded=True)
+                with _mtc2:
+                    if st.button("\U0001f5d1\ufe0f", key=f"del_matrix_{_mi}",
+                                 help=f"Usu\u0144 {entry['name']}"):
+                        st.session_state.matrix_results.pop(_mi)
+                        st.rerun()
+                with _mtexp:
                     mat_df   = entry['df']
                     cats     = entry['cats']
                     sub_lbls = entry.get('sub_labels', [])
@@ -4009,8 +4231,48 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
 
                     _style_matrix_row = _make_style_matrix_row(SUMROW)
 
+                    # Deduplicate index/columns before styling \u2014 Styler crashes on duplicates
+                    _sdf = view_df.copy()
+                    if not _sdf.index.is_unique:
+                        _seen = {}
+                        _new_idx = []
+                        for v in _sdf.index:
+                            k = str(v)
+                            if k in _seen:
+                                _seen[k] += 1
+                                _new_idx.append(f"{v} ({_seen[k]})")
+                            else:
+                                _seen[k] = 1
+                                _new_idx.append(v)
+                        _sdf.index = _new_idx
+                    if not _sdf.columns.is_unique:
+                        _seen = {}
+                        _new_cols = []
+                        for v in _sdf.columns:
+                            k = str(v)
+                            if k in _seen:
+                                _seen[k] += 1
+                                _new_cols.append(f"{v} ({_seen[k]})")
+                            else:
+                                _seen[k] = 1
+                                _new_cols.append(v)
+                        _sdf.columns = _new_cols
 
-                    styled = view_df.style.apply(_style_matrix_row, axis=1).format(_fmt_cell)
+                    # Per-column format: N columns as integer, % columns as 1 decimal
+                    _fmt_map = {}
+                    for _c in _sdf.columns:
+                        _cstr = str(_c)
+                        if "[N]" in _cstr:
+                            _fmt_map[_c] = lambda v: ("" if (v == "" or (isinstance(v, float) and np.isnan(v)))
+                                                       else (f"{int(round(float(v))):,}"
+                                                             if isinstance(v, (int, float)) and not (isinstance(v, float) and np.isnan(v))
+                                                             else str(v)))
+                        elif "[%]" in _cstr:
+                            _fmt_map[_c] = _fmt_cell
+                        else:
+                            _fmt_map[_c] = _fmt_cell
+
+                    styled = _sdf.style.apply(_style_matrix_row, axis=1).format(_fmt_map)
                     st.dataframe(styled, use_container_width=True)
 
                     if show_chart_mat and cats and sub_lbls:
@@ -4036,6 +4298,53 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
                         st.plotly_chart(fig_mat, use_container_width=True, key=f"pc_mat_{entry.get('name','m')}")
 
     with tab_cross:
+        with st.expander("\U0001f4d6 Jak wykona\u0107 i interpretowa\u0107 tabel\u0119 krzy\u017cow\u0105", expanded=False):
+            st.markdown("""
+### Czym jest tabela krzy\u017cowa?
+
+Tabela krzy\u017cowa (tabulacja krzy\u017cowa) pokazuje jak rozk\u0142ada si\u0119 jedna zmienna wzgl\u0119dem innej.
+Pozwala sprawdzi\u0107 czy istnieje zwi\u0105zek mi\u0119dzy dwiema zmiennymi kategorycznymi.
+
+---
+
+### Jak wype\u0142ni\u0107 pola?
+
+- **Zmienne w wierszach** \u2014 zmienna kt\u00f3r\u0105 chcesz analizowa\u0107 (np. opinia, zachowanie)
+- **Zmienne w kolumnach** \u2014 zmienna grupuj\u0105ca (np. p\u0142e\u0107, wiek, region)
+
+> Wskaz\u00f3wka: w kolumnach najcz\u0119\u015bciej umieszcza si\u0119 metryczk\u0119 (p\u0142e\u0107, wykszta\u0142cenie), a w wierszach pytanie badawcze.
+
+---
+
+### Spos\u00f3b prezentacji
+
+| Opcja | Kiedy u\u017cywa\u0107 |
+|---|---|
+| **Liczebno\u015bci** | Por\u00f3wnanie surowych N, ma\u0142e pr\u00f3by |
+| **Kolumnowe (%)** | Najcz\u0119\u015bcej stosowane \u2014 % w ramach ka\u017cdej grupy z kolumny (np. % kobiet kt\u00f3re powiedzia\u0142y TAK) |
+| **Wierszowe (%)** | % w ramach ka\u017cdego wiersza \u2014 przydatne gdy zmienna wierszowa jest pytaniem wielokrotnego wyboru |
+| **Liczebno\u015bci + %** | Pe\u0142ny obraz: N i % razem |
+
+---
+
+### Testy statystyczne
+
+- **Chi-kwadrat (\u03c7\u00b2)** \u2014 sprawdza czy rozk\u0142ad zmiennej jest niezale\u017cny od grupy
+  - p < 0.05 \u2192 istnieje statystycznie istotny zwi\u0105zek
+  - p \u2265 0.05 \u2192 brak podstaw do odrzucenia niezale\u017cno\u015bci
+- **V Kramera** \u2014 si\u0142a zwi\u0105zku niezale\u017cnie od rozmiaru tabeli
+  - < 0.1 brak | 0.1\u20130.3 s\u0142aby | 0.3\u20130.5 umiarkowany | > 0.5 silny
+- **Testy Z (95%)** \u2014 por\u00f3wnanie par kolumn \u2014 oznaczenia literowe (A, B...) wskazuj\u0105 istotne r\u00f3\u017cnice mi\u0119dzy grupami
+
+---
+
+### Uwagi praktyczne
+
+- Tabela krzy\u017cowa wymaga zmiennych **kategorycznych** \u2014 unikaj zmiennych z du\u017c\u0105 liczb\u0105 unikalnych warto\u015bci
+- Przy ma\u0142ych liczebno\u015bciach (N < 5 w kom\u00f3rce) wyniki chi-kwadrat s\u0105 nierzetelne
+- Przy wa\u017ceniu \u2014 N i % s\u0105 wa\u017cone, ale chi-kwadrat obliczany jest na wa\u017conych liczebno\u015bciach
+            """)
+
         col1, col2 = st.columns(2)
         with col1: row_vars = st.multiselect("Zmienne w wierszach:", all_options, format_func=lambda x: get_var_display_name(x, var_labels))
         with col2: col_vars = st.multiselect("Zmienne w kolumnach:", all_options, format_func=lambda x: get_var_display_name(x, var_labels))
@@ -4047,8 +4356,6 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
         show_charts_cross = c4.checkbox("\U0001f4ca Wykresy")
 
         if st.button("\u25b6\ufe0f Generuj tabele krzy\u017cowe", type="primary") and row_vars and col_vars:
-            st.session_state.results['krzyzowe'] = {}
-            st.session_state.chi_results = {}
             w = st.session_state.weights if use_weights else np.ones(len(df_raw))
             for row_var in row_vars:
                 for col_var in col_vars:
@@ -4194,8 +4501,25 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
         if st.session_state.results.get('krzyzowe'):
             st.divider()
             st.markdown(f"**Zapisane wyniki ({len(st.session_state.results['krzyzowe'])} tabel):**")
-            for title, cross_df in st.session_state.results['krzyzowe'].items():
-                with st.expander(title, expanded=False):
+            _cc1, _cc2 = st.columns([5, 1])
+            _cc1.markdown(f"**Zapisane tabele krzy\u017cowe ({len(st.session_state.results['krzyzowe'])}):**")
+            with _cc2:
+                if st.button("\U0001f5d1\ufe0f Usu\u0144 wszystkie", key="del_all_cross",
+                             use_container_width=True):
+                    st.session_state.results['krzyzowe'] = {}
+                    st.session_state.chi_results = {}
+                    st.rerun()
+            for title, cross_df in list(st.session_state.results['krzyzowe'].items()):
+                _xc1, _xc2 = st.columns([6, 1])
+                with _xc1:
+                    _xexp = st.expander(title, expanded=False)
+                with _xc2:
+                    if st.button("\U0001f5d1\ufe0f", key=f"del_cross_{title}",
+                                 help=f"Usu\u0144 {title}"):
+                        st.session_state.results['krzyzowe'].pop(title, None)
+                        st.session_state.chi_results.pop(title, None)
+                        st.rerun()
+                with _xexp:
                     st.dataframe(safe_style(cross_df), use_container_width=True)
                     if title in st.session_state.chi_results:
                         st.caption(f"\U0001f9ee {st.session_state.chi_results[title]}")
@@ -4206,7 +4530,6 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
         with col2: mean_cols_sel = st.multiselect("Metryczka (kolumny):", all_options, format_func=lambda x: get_var_display_name(x, var_labels))
         do_means_sig = st.checkbox("\U0001f520 Oznacz istotne r\u00f3\u017cnice \u015brednich (T-Test 95%)")
         if st.button("\u25b6\ufe0f Generuj tabele \u015brednich", type="primary") and mean_rows and mean_cols_sel:
-            st.session_state.results['srednie'] = {}
             w = st.session_state.weights if use_weights else np.ones(len(df_raw))
             for row_var in mean_rows:
                 for col_var in mean_cols_sel:
@@ -4245,10 +4568,32 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
                         title = f"{row_var} x {col_var}"
                         st.session_state.results['srednie'][title] = df_means
                         with st.expander(title):
-                            st.dataframe(df_means.style.format(get_streamlit_format(df_means)), use_container_width=True)
+                            st.dataframe(_format_means_table(df_means), use_container_width=True)
                     except Exception as e:
                         st.error(f"B\u0142\u0105d: {e}")
             st.success("\u2705 Tabele \u015brednich wygenerowane!")
+
+        # Persistent display of means with delete
+        if st.session_state.results.get('srednie'):
+            st.divider()
+            _mc1, _mc2 = st.columns([5, 1])
+            _mc1.markdown(f"**Zapisane tabele \u015brednich ({len(st.session_state.results['srednie'])}):**")
+            with _mc2:
+                if st.button("\U0001f5d1\ufe0f Usu\u0144 wszystkie", key="del_all_means",
+                             use_container_width=True):
+                    st.session_state.results['srednie'] = {}
+                    st.rerun()
+            for title, df_means in list(st.session_state.results['srednie'].items()):
+                _mec1, _mec2 = st.columns([6, 1])
+                with _mec1:
+                    _mexp = st.expander(title, expanded=False)
+                with _mec2:
+                    if st.button("\U0001f5d1\ufe0f", key=f"del_means_{title}",
+                                 help=f"Usu\u0144 {title}"):
+                        st.session_state.results['srednie'].pop(title, None)
+                        st.rerun()
+                with _mexp:
+                    st.dataframe(_format_means_table(df_means), use_container_width=True)
 
     with tab_desc:
         desc_vars = st.multiselect("Zmienne numeryczne:", numeric_cols,
@@ -4335,7 +4680,7 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
                     n_miss  = int(df_raw[c].isna().sum())
                     n_w     = float(w.sum())   # effective weighted N
 
-                    if d_n_valid:  row['N wa\u017cnych (wa\u017cone)'] = round(n_w, 2)
+                    if d_n_valid:  row['N wa\u017cnych (wa\u017cone)'] = int(round(n_w))
                     if d_n_miss:   row['N brak\u00f3w']               = n_miss
 
                     if d_mean:
@@ -4436,7 +4781,7 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
                 num_corr.columns = [var_labels.get(c, c) for c in num_corr.columns]
 
                 st.session_state.results['korelacje']['Macierz Korelacji'] = corr_df
-                st.write(f"**Metoda:** {corr_method.title()} | **N wa\u017cnych obserwacji:** {n_obs}")
+                st.write(f"**Metoda:** {corr_method.title()} | **N wa\u017cnych obserwacji:** {int(round(float(n_obs)))}")
 
                 # \u2500\u2500 Color-coded table \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
                 _color_corr_cell = _make_color_corr_cell(corr_threshold)
@@ -4579,19 +4924,39 @@ elif menu == "\U0001f4c9 Regresja":
                 st.error("Dodaj co najmniej jeden predyktor.")
             else:
                 with st.spinner("Obliczanie regresji OLS..."):
-                    st.session_state.regression_results = run_regression_block(
+                    _new_reg = run_regression_block(
                         df_raw, dep_var, valid_blocks,
                         weights=st.session_state.weights if use_weights else None
                     )
+                    for _r in _new_reg:
+                        _merge_result(st.session_state.regression_results, _r,
+                            key_fn=lambda r: (r.get('dep_var',''), r.get('block_idx', 0)))
 
-        for res in st.session_state.regression_results:
+        if st.session_state.regression_results:
+            _rgc1, _rgc2 = st.columns([5, 1])
+            _rgc1.markdown(f"**Zapisane modele regresji ({len(st.session_state.regression_results)}):**")
+            with _rgc2:
+                if st.button("\U0001f5d1\ufe0f Usu\u0144 wszystkie", key="del_all_reg",
+                             use_container_width=True):
+                    st.session_state.regression_results = []
+                    st.rerun()
+
+        for _ri, res in enumerate(list(st.session_state.regression_results)):
             if 'error' in res:
                 st.error(res['error'])
                 continue
             dep_label = var_labels.get(res['dep_var'], res['dep_var'])
-            with st.expander(f"\U0001f4ca Blok {res['Blok']} -- [{res['dep_var']}] {dep_label}", expanded=True):
+            _rc1, _rc2 = st.columns([6, 1])
+            with _rc1:
+                _rexp = st.expander(f"\U0001f4ca Blok {res['Blok']} -- [{res['dep_var']}] {dep_label}", expanded=True)
+            with _rc2:
+                if st.button("\U0001f5d1\ufe0f", key=f"del_reg_{_ri}",
+                             help=f"Usu\u0144 model {res['dep_var']}"):
+                    st.session_state.regression_results.pop(_ri)
+                    st.rerun()
+            with _rexp:
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("N", f"{res['N']:,}")
+                m1.metric("N", f"{int(round(float(res['N']))):,}")
                 m2.metric("R\u00b2", f"{res['R2']:.4f}")
                 m3.metric("Skorygowane R\u00b2", f"{res['Skor_R2']:.4f}")
                 m4.metric("\u0394R\u00b2", f"{res['Delta_R2']:.4f}")
@@ -4783,17 +5148,35 @@ Modeluje prawdopodobie\u0144stwo przynale\u017cno\u015bci do kategorii.
                                                 'pseudo_r2': model.prsquared, 'llr_p': model.llr_pvalue,
                                                 'aic': model.aic, 'bic': model.bic, 'log_lik': model.llf,
                                                 'coef_df': None, 'model': model, 'error': None}
-                            st.session_state.logistic_results.append(result_entry)
+                            _merge_result(st.session_state.logistic_results, result_entry,
+                                key_fn=lambda r: (r.get('dep_var',''), r.get('type','')))
                             st.success("\u2705 Regresja logistyczna obliczona!")
                     except Exception as _lg_err:
                         st.error(f"B\u0142\u0105d: {_lg_err}")
 
-        for res_lg in st.session_state.logistic_results:
+        if st.session_state.logistic_results:
+            _lgc1, _lgc2 = st.columns([5, 1])
+            _lgc1.markdown(f"**Zapisane modele logistyczne ({len(st.session_state.logistic_results)}):**")
+            with _lgc2:
+                if st.button("\U0001f5d1\ufe0f Usu\u0144 wszystkie", key="del_all_log",
+                             use_container_width=True):
+                    st.session_state.logistic_results = []
+                    st.rerun()
+
+        for _lgi, res_lg in enumerate(list(st.session_state.logistic_results)):
             if res_lg.get('error'): st.error(res_lg['error']); continue
             dep_lbl = var_labels.get(res_lg['dep_var'], res_lg['dep_var'])
-            with st.expander(f"\U0001f4c9 {res_lg['type']}: [{res_lg['dep_var']}] {dep_lbl}", expanded=True):
+            _lgec1, _lgec2 = st.columns([6, 1])
+            with _lgec1:
+                _lgexp = st.expander(f"\U0001f4c9 {res_lg['type']}: [{res_lg['dep_var']}] {dep_lbl}", expanded=True)
+            with _lgec2:
+                if st.button("\U0001f5d1\ufe0f", key=f"del_log_{_lgi}",
+                             help=f"Usu\u0144 {res_lg['dep_var']}"):
+                    st.session_state.logistic_results.pop(_lgi)
+                    st.rerun()
+            with _lgexp:
                 m1,m2,m3,m4,m5 = st.columns(5)
-                m1.metric("N", f"{res_lg['n_obs']:,}")
+                m1.metric("N", f"{int(round(float(res_lg['n_obs']))):,}")
                 m2.metric("Pseudo R\u00b2", f"{res_lg['pseudo_r2']:.4f}")
                 m3.metric("p (LLR)", f"{res_lg['llr_p']:.4f}")
                 m4.metric("AIC", f"{res_lg['aic']:.1f}")
@@ -4927,16 +5310,14 @@ za\u0142o\u017cenie wielu test\u00f3w parametrycznych: **t-testu, ANOVA, regresj
                 x = df_raw[var].dropna().values.astype(float)
 
             n = len(x)
-            lbl = var_labels.get(var, var)
-
-            st.markdown(f"---\n#### \U0001f4ca `{var}` \u2014 {lbl}")
-            st.caption(f"N = {len(df_raw[var].dropna()):,} obserwacji (efektywne N do test\u00f3w: {n:,})")
+            n_raw = len(df_raw[var].dropna())
 
             # \u2500\u2500 Normality tests \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
             test_rows = []
+            warn_msg = None
             if "Shapiro-Wilk" in norm_tests:
                 if n > 5000:
-                    st.warning("Shapiro-Wilk: pr\u00f3ba zbyt du\u017ca (N > 5000). U\u017cyto losowej pr\u00f3bki 5000.")
+                    warn_msg = "Shapiro-Wilk: pr\u00f3ba zbyt du\u017ca (N > 5000). U\u017cyto losowej pr\u00f3bki 5000."
                     x_sw = np.random.choice(x, 5000, replace=False)
                 else:
                     x_sw = x
@@ -4967,84 +5348,121 @@ za\u0142o\u017cenie wielu test\u00f3w parametrycznych: **t-testu, ANOVA, regresj
                     "Wynik": "\u2705 Normalny" if dag_p > norm_alpha else "\u274c Nienormalny"
                 })
 
-            test_df = pd.DataFrame(test_rows)
+            # Store result in session state
+            st.session_state.normality_results[var] = {
+                'var': var,
+                'x': x.tolist(),           # store as list (picklable for cache/project save)
+                'n': n,
+                'n_raw': n_raw,
+                'test_df': pd.DataFrame(test_rows),
+                'warn_msg': warn_msg,
+                'show_qq': bool(norm_show_qq),
+                'show_hist': bool(norm_show_hist),
+                'show_desc': bool(norm_show_desc),
+                'alpha': float(norm_alpha),
+            }
 
-            def _style_norm_row(row):
-                color = '#E2EFDA' if '\u2705' in row['Wynik'] else '#FCE4D6'
-                return [f'background-color: {color}'] * len(row)
+    # \u2500\u2500 Display all stored results with delete UI \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    if st.session_state.normality_results:
+        st.divider()
+        _nhc1, _nhc2 = st.columns([5, 1])
+        _nhc1.markdown(f"**Zapisane testy normalno\u015bci ({len(st.session_state.normality_results)}):**")
+        with _nhc2:
+            if st.button("\U0001f5d1\ufe0f Usu\u0144 wszystkie", key="del_all_norm",
+                         use_container_width=True):
+                st.session_state.normality_results = {}
+                st.rerun()
 
-            st.dataframe(test_df.style.apply(_style_norm_row, axis=1)
-                         .format({'Statystyka': '{:.4f}', 'p-value': '{:.4f}'}),
-                         use_container_width=True, hide_index=True)
+        for var, nres in list(st.session_state.normality_results.items()):
+            lbl = var_labels.get(var, var)
+            _nec1, _nec2 = st.columns([6, 1])
+            with _nec1:
+                _nexp = st.expander(f"\U0001f4ca {var} \u2014 {lbl}", expanded=True)
+            with _nec2:
+                if st.button("\U0001f5d1\ufe0f", key=f"del_norm_{var}",
+                             help=f"Usu\u0144 test dla {var}"):
+                    st.session_state.normality_results.pop(var, None)
+                    st.rerun()
+            with _nexp:
+                x = np.array(nres['x'])
+                n = nres['n']
+                st.caption(f"N = {nres['n_raw']:,} obserwacji (efektywne N do test\u00f3w: {n:,})")
+                if nres.get('warn_msg'):
+                    st.warning(nres['warn_msg'])
 
-            # \u2500\u2500 Descriptives \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-            if norm_show_desc:
-                skew_v = float(stats.skew(x))
-                kurt_v = float(stats.kurtosis(x))
-                sk_interp = ("symetryczny" if abs(skew_v) < 0.5
-                             else ("lekko sko\u015bny" if abs(skew_v) < 1.0
-                                   else ("umiarkowanie sko\u015bny" if abs(skew_v) < 2.0
-                                         else "silnie sko\u015bny")))
-                kt_interp = ("mezokurtyczny (normalny)" if abs(kurt_v) < 1.0
-                             else ("platykurtyczny (sp\u0142aszczony)" if kurt_v < 0
-                                   else "leptokurtyczny (smuk\u0142y)"))
-                desc_c1, desc_c2, desc_c3, desc_c4 = st.columns(4)
-                desc_c1.metric("Sko\u015bno\u015b\u0107", f"{skew_v:.4f}")
-                desc_c2.metric("Kurtoza", f"{kurt_v:.4f}")
-                desc_c3.metric("Ocena sko\u015bno\u015bci", sk_interp)
-                desc_c4.metric("Ocena kurtozy", kt_interp)
+                def _style_norm_row(row):
+                    color = '#E2EFDA' if '\u2705' in row['Wynik'] else '#FCE4D6'
+                    return [f'background-color: {color}'] * len(row)
 
-            # \u2500\u2500 Plots \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-            plot_cols = st.columns(2 if (norm_show_qq and norm_show_hist) else 1)
-            plot_idx = 0
+                st.dataframe(nres['test_df'].style.apply(_style_norm_row, axis=1)
+                             .format({'Statystyka': '{:.4f}', 'p-value': '{:.4f}'}),
+                             use_container_width=True, hide_index=True)
 
-            if norm_show_qq:
-                (osm, osr), (slope, intercept, r) = stats.probplot(x, dist='norm')
-                fig_qq = go.Figure()
-                fig_qq.add_trace(go.Scatter(
-                    x=list(osm), y=list(osr),
-                    mode='markers', name='Obserwacje',
-                    marker=dict(color='#2E75B6', size=4, opacity=0.6)
-                ))
-                fig_qq.add_trace(go.Scatter(
-                    x=[min(osm), max(osm)],
-                    y=[slope * min(osm) + intercept, slope * max(osm) + intercept],
-                    mode='lines', name='Linia normalna',
-                    line=dict(color='#C00000', dash='dash')
-                ))
-                fig_qq.update_layout(
-                    title=f"Wykres Q-Q: {lbl}",
-                    xaxis_title="Kwantyle teoretyczne",
-                    yaxis_title="Kwantyle pr\u00f3bkowe",
-                    height=350, showlegend=True
-                )
-                with plot_cols[plot_idx]:
-                    st.plotly_chart(fig_qq, use_container_width=True, key=f"qq_{var}")
-                plot_idx += 1
+                if nres.get('show_desc'):
+                    skew_v = float(stats.skew(x))
+                    kurt_v = float(stats.kurtosis(x))
+                    sk_interp = ("symetryczny" if abs(skew_v) < 0.5
+                                 else ("lekko sko\u015bny" if abs(skew_v) < 1.0
+                                       else ("umiarkowanie sko\u015bny" if abs(skew_v) < 2.0
+                                             else "silnie sko\u015bny")))
+                    kt_interp = ("mezokurtyczny (normalny)" if abs(kurt_v) < 1.0
+                                 else ("platykurtyczny (sp\u0142aszczony)" if kurt_v < 0
+                                       else "leptokurtyczny (smuk\u0142y)"))
+                    desc_c1, desc_c2, desc_c3, desc_c4 = st.columns(4)
+                    desc_c1.metric("Sko\u015bno\u015b\u0107", f"{skew_v:.4f}")
+                    desc_c2.metric("Kurtoza", f"{kurt_v:.4f}")
+                    desc_c3.metric("Ocena sko\u015bno\u015bci", sk_interp)
+                    desc_c4.metric("Ocena kurtozy", kt_interp)
 
-            if norm_show_hist:
-                fig_hist = go.Figure()
-                fig_hist.add_trace(go.Histogram(
-                    x=x, name="Dane",
-                    histnorm='probability density',
-                    marker_color='#2E75B6', opacity=0.7,
-                    nbinsx=min(50, max(10, n // 10))
-                ))
-                # Overlay normal curve
-                x_range = np.linspace(x.min(), x.max(), 200)
-                mu, sigma = float(x.mean()), float(x.std())
-                y_norm = stats.norm.pdf(x_range, mu, sigma)
-                fig_hist.add_trace(go.Scatter(
-                    x=x_range, y=y_norm, mode='lines', name='Rozk\u0142ad normalny',
-                    line=dict(color='#C00000', width=2)
-                ))
-                fig_hist.update_layout(
-                    title=f"Histogram z krzywa normaln\u0105: {lbl}",
-                    xaxis_title=lbl, yaxis_title="G\u0119sto\u015b\u0107",
-                    height=350, showlegend=True, barmode='overlay'
-                )
-                with plot_cols[plot_idx]:
-                    st.plotly_chart(fig_hist, use_container_width=True, key=f"hist_{var}")
+                plot_cols = st.columns(2 if (nres.get('show_qq') and nres.get('show_hist')) else 1)
+                plot_idx = 0
+
+                if nres.get('show_qq'):
+                    (osm, osr), (slope, intercept, r) = stats.probplot(x, dist='norm')
+                    fig_qq = go.Figure()
+                    fig_qq.add_trace(go.Scatter(
+                        x=list(osm), y=list(osr),
+                        mode='markers', name='Obserwacje',
+                        marker=dict(color='#2E75B6', size=4, opacity=0.6)
+                    ))
+                    fig_qq.add_trace(go.Scatter(
+                        x=[min(osm), max(osm)],
+                        y=[slope * min(osm) + intercept, slope * max(osm) + intercept],
+                        mode='lines', name='Linia normalna',
+                        line=dict(color='#C00000', dash='dash')
+                    ))
+                    fig_qq.update_layout(
+                        title=f"Wykres Q-Q: {lbl}",
+                        xaxis_title="Kwantyle teoretyczne",
+                        yaxis_title="Kwantyle pr\u00f3bkowe",
+                        height=350, showlegend=True
+                    )
+                    with plot_cols[plot_idx]:
+                        st.plotly_chart(fig_qq, use_container_width=True, key=f"qq_{var}")
+                    plot_idx += 1
+
+                if nres.get('show_hist'):
+                    fig_hist = go.Figure()
+                    fig_hist.add_trace(go.Histogram(
+                        x=x, name="Dane",
+                        histnorm='probability density',
+                        marker_color='#2E75B6', opacity=0.7,
+                        nbinsx=min(50, max(10, n // 10))
+                    ))
+                    x_range = np.linspace(x.min(), x.max(), 200)
+                    mu, sigma = float(x.mean()), float(x.std())
+                    y_norm = stats.norm.pdf(x_range, mu, sigma)
+                    fig_hist.add_trace(go.Scatter(
+                        x=x_range, y=y_norm, mode='lines', name='Rozk\u0142ad normalny',
+                        line=dict(color='#C00000', width=2)
+                    ))
+                    fig_hist.update_layout(
+                        title=f"Histogram z krzywa normaln\u0105: {lbl}",
+                        xaxis_title=lbl, yaxis_title="G\u0119sto\u015b\u0107",
+                        height=350, showlegend=True, barmode='overlay'
+                    )
+                    with plot_cols[plot_idx]:
+                        st.plotly_chart(fig_hist, use_container_width=True, key=f"hist_{var}")
 
 
 elif menu == "\U0001f4ca ANOVA":
@@ -5094,12 +5512,30 @@ p < 0.05 dla danej pary = ta para jest istotnie r\u00f3\u017cna.
             if err:
                 st.error(err)
             else:
-                st.session_state.anova_results.append(result)
+                _merge_result(st.session_state.anova_results, result,
+                    key_fn=lambda r: (r.get('dep_var',''), r.get('group_var','')))
 
-    for res in st.session_state.anova_results:
+    if st.session_state.anova_results:
+        _anc1, _anc2 = st.columns([5, 1])
+        _anc1.markdown(f"**Zapisane analizy ANOVA ({len(st.session_state.anova_results)}):**")
+        with _anc2:
+            if st.button("\U0001f5d1\ufe0f Usu\u0144 wszystkie", key="del_all_anova",
+                         use_container_width=True):
+                st.session_state.anova_results = []
+                st.rerun()
+
+    for _ai, res in enumerate(list(st.session_state.anova_results)):
         dep_l = var_labels.get(res['dep_var'], res['dep_var'])
         grp_l = var_labels.get(res['group_var'], res['group_var'])
-        with st.expander(f"\U0001f4ca ANOVA: [{res['dep_var']}] {dep_l} \u00d7 [{res['group_var']}] {grp_l}", expanded=True):
+        _ac1, _ac2 = st.columns([6, 1])
+        with _ac1:
+            _aexp = st.expander(f"\U0001f4ca ANOVA: [{res['dep_var']}] {dep_l} \u00d7 [{res['group_var']}] {grp_l}", expanded=True)
+        with _ac2:
+            if st.button("\U0001f5d1\ufe0f", key=f"del_anova_{_ai}",
+                         help=f"Usu\u0144 {res['dep_var']} x {res['group_var']}"):
+                st.session_state.anova_results.pop(_ai)
+                st.rerun()
+        with _aexp:
             sig_label = "\u2705 Istotna statystycznie (p < 0.05)" if res['p'] < 0.05 else "\u274c Brak istotno\u015bci (p \u2265 0.05)"
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("F", f"{res['F']:.3f}")
@@ -5134,7 +5570,7 @@ p < 0.05 dla danej pary = ta para jest istotnie r\u00f3\u017cna.
                 marker_color='#2E75B6', name='\u015arednia \u00b1 Odch.std.'
             ))
             fig_anova.update_layout(title=f"\u015arednie wg grup -- {dep_l}", xaxis_title=grp_l, yaxis_title='Srednia', height=350)
-            st.plotly_chart(fig_anova, use_container_width=True, key="pc_anova_bar")
+            st.plotly_chart(fig_anova, use_container_width=True, key=f"pc_anova_bar_{res['dep_var']}_{res['group_var']}")
 
             if not res['posthoc_df'].empty:
                 st.markdown("**Test post-hoc Tukey HSD:**")
@@ -5206,12 +5642,30 @@ Przyk\u0142ad: 15 pyta\u0144 o satysfakcj\u0119 mo\u017ce odzwierciedla\u0107 3 
                 if err:
                     st.error(err)
                 else:
-                    st.session_state.factor_results.append(result)
+                    _merge_result(st.session_state.factor_results, result,
+                        key_fn=lambda r: (tuple(sorted(r.get('variables',[]))), r.get('rotation','')))
 
-        for res in st.session_state.factor_results:
-            with st.expander(f"\U0001f52c Analiza czynnikowa -- {res['rotation'].upper()} -- N={res['n']}", expanded=True):
+        if st.session_state.factor_results:
+            _fcc1, _fcc2 = st.columns([5, 1])
+            _fcc1.markdown(f"**Zapisane analizy czynnikowe ({len(st.session_state.factor_results)}):**")
+            with _fcc2:
+                if st.button("\U0001f5d1\ufe0f Usu\u0144 wszystkie", key="del_all_factor",
+                             use_container_width=True):
+                    st.session_state.factor_results = []
+                    st.rerun()
+
+        for _fi, res in enumerate(list(st.session_state.factor_results)):
+            _fec1, _fec2 = st.columns([6, 1])
+            with _fec1:
+                _fexp = st.expander(f"\U0001f52c Analiza czynnikowa -- {res['rotation'].upper()} -- N={res['n']}", expanded=True)
+            with _fec2:
+                if st.button("\U0001f5d1\ufe0f", key=f"del_factor_{_fi}",
+                             help="Usu\u0144 analiz\u0119"):
+                    st.session_state.factor_results.pop(_fi)
+                    st.rerun()
+            with _fexp:
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("N obserwacji", f"{res['n']:,}")
+                m1.metric("N obserwacji", f"{int(round(float(res['n']))):,}")
                 m2.metric("KMO", f"{res['kmo']:.3f}", help="\u22650.7 = dobra adekwatnosc proby")
                 m3.metric("Bartlett Chi\u00b2", f"{res['bartlett_chi2']:.2f}")
                 m4.metric("Bartlett p", f"{res['bartlett_p']:.4f}", delta="\u2705 OK" if res['bartlett_p'] < 0.05 else "\u274c")
@@ -5327,16 +5781,34 @@ Conjoint (analiza l\u0105czna) mierzy, jak poszczeg\u00f3lne cechy produktu wp\u
             if err:
                 st.error(err)
             else:
-                st.session_state.conjoint_results.append(res)
+                _merge_result(st.session_state.conjoint_results, res,
+                    key_fn=lambda r: (r.get('method',''), tuple(sorted(r.get('attribute_vars',[])))))
                 st.success("\u2705 Analiza Conjoint uko\u0144czona!")
 
-    for res in st.session_state.conjoint_results:
+    if st.session_state.conjoint_results:
+        _cjc1, _cjc2 = st.columns([5, 1])
+        _cjc1.markdown(f"**Zapisane analizy Conjoint ({len(st.session_state.conjoint_results)}):**")
+        with _cjc2:
+            if st.button("\U0001f5d1\ufe0f Usu\u0144 wszystkie", key="del_all_conj",
+                         use_container_width=True):
+                st.session_state.conjoint_results = []
+                st.rerun()
+
+    for _cji, res in enumerate(list(st.session_state.conjoint_results)):
         if res.get('error'):
             st.error(res['error']); continue
-        with st.expander(f"\U0001f4ca {res['method']} -- {len(res['attribute_vars'])} atrybut\u00f3w", expanded=True):
+        _cjec1, _cjec2 = st.columns([6, 1])
+        with _cjec1:
+            _cjexp = st.expander(f"\U0001f4ca {res['method']} -- {len(res['attribute_vars'])} atrybut\u00f3w", expanded=True)
+        with _cjec2:
+            if st.button("\U0001f5d1\ufe0f", key=f"del_conj_{_cji}",
+                         help="Usu\u0144 analiz\u0119"):
+                st.session_state.conjoint_results.pop(_cji)
+                st.rerun()
+        with _cjexp:
             # Summary metrics
             mc1, mc2, mc3, mc4 = st.columns(4)
-            mc1.metric("N", f"{res['n']:,}")
+            mc1.metric("N", f"{int(round(float(res['n']))):,}")
             if 'r2' in res:
                 mc2.metric("R\u00b2", f"{res['r2']:.4f}")
                 mc3.metric("R\u00b2 skor.", f"{res['r2_adj']:.4f}")
@@ -5353,21 +5825,47 @@ Conjoint (analiza l\u0105czna) mierzy, jak poszczeg\u00f3lne cechy produktu wp\u
             fig_imp = px.bar(imp_df, x='Wa\u017cno\u015b\u0107 (%)', y='Etykieta', orientation='h',
                              color='Wa\u017cno\u015b\u0107 (%)', color_continuous_scale='Blues',
                              title='Wa\u017cno\u015b\u0107 atrybut\u00f3w (%)'),
-            st.plotly_chart(fig_imp[0], use_container_width=True, key="pc_conj_imp")
+            st.plotly_chart(fig_imp[0], use_container_width=True, key=f"pc_conj_imp_{_cji}")
 
             # Utilities per attribute
             st.markdown("**U\u017cyteczno\u015bci cz\u0105stkowe (part-worth utilities):**")
             for attr, utils in res['utilities'].items():
                 if not utils: continue
                 attr_lbl = var_labels.get(attr, attr)
+                # Build display labels: "attr_valueLabel" instead of "attr_code"
+                _vvl = meta_orig.variable_value_labels.get(attr, {}) if is_spss else {}
+                _cvl = st.session_state.custom_val_labels.get(attr, {})
+                def _nice_level(raw_lvl):
+                    """Convert dummy-column name like 'Q1_A1' \u2192 'Q1_zdecydowanie'."""
+                    s = str(raw_lvl)
+                    # Strip attribute prefix (e.g. 'Q1_') to isolate the code
+                    prefix = f"{attr}_"
+                    code_part = s[len(prefix):] if s.startswith(prefix) else s
+                    # Try custom val labels first, then SPSS labels
+                    lbl_txt = _cvl.get(code_part, _cvl.get(str(code_part), ""))
+                    if not lbl_txt:
+                        # Try numeric conversion for SPSS labels
+                        for key_variant in (code_part, str(code_part)):
+                            try:
+                                fv = float(key_variant)
+                                lbl_txt = _vvl.get(fv, _vvl.get(int(fv), ""))
+                                if lbl_txt:
+                                    break
+                            except (ValueError, TypeError):
+                                pass
+                        if not lbl_txt:
+                            lbl_txt = _vvl.get(code_part, "")
+                    return f"{attr}_{lbl_txt}" if lbl_txt else s
+
                 u_df = pd.DataFrame(list(utils.items()), columns=['Poziom', 'U\u017cyteczno\u015b\u0107'])
+                u_df['Poziom'] = u_df['Poziom'].apply(_nice_level)
                 u_df = u_df.sort_values('U\u017cyteczno\u015b\u0107', ascending=True)
                 fig_u = px.bar(u_df, x='U\u017cyteczno\u015b\u0107', y='Poziom', orientation='h',
                                title=f"[{attr}] {attr_lbl}",
                                color='U\u017cyteczno\u015b\u0107', color_continuous_scale='RdYlGn',
                                color_continuous_midpoint=0)
                 fig_u.add_vline(x=0, line_dash='dash', line_color='gray')
-                st.plotly_chart(fig_u, use_container_width=True, key=f"pc_conj_util_{attr}")
+                st.plotly_chart(fig_u, use_container_width=True, key=f"pc_conj_util_{_cji}_{attr}")
 
     if st.session_state.conjoint_results:
         if st.button("\U0001f5d1\ufe0f Wyczy\u015b\u0107 wyniki Conjoint", type="secondary"):
@@ -5497,14 +5995,32 @@ Przyk\u0142ad: `Zestaw1_Best`, `Zestaw1_Worst`, `Zestaw2_Best`, `Zestaw2_Worst`,
                 'n_tasks': len(valid_pairs),
                 'scores': df_scores,
             }
-            st.session_state.maxdiff_results.append(result_md)
+            _merge_result(st.session_state.maxdiff_results, result_md,
+                key_fn=lambda r: r.get('name',''))
             st.success(f"\u2705 MaxDiff uko\u0144czony! Przeanalizowano {len(valid_pairs)} zestaw\u00f3w, {len(md_items)} pozycji.")
 
-    for res in st.session_state.maxdiff_results:
-        with st.expander(f"\U0001f522 {res['name']} -- {res['n_tasks']} zestaw\u00f3w, {len(res['items'])} pozycji", expanded=True):
+    if st.session_state.maxdiff_results:
+        _mdc1, _mdc2 = st.columns([5, 1])
+        _mdc1.markdown(f"**Zapisane analizy MaxDiff ({len(st.session_state.maxdiff_results)}):**")
+        with _mdc2:
+            if st.button("\U0001f5d1\ufe0f Usu\u0144 wszystkie", key="del_all_md",
+                         use_container_width=True):
+                st.session_state.maxdiff_results = []
+                st.rerun()
+
+    for _mdi, res in enumerate(list(st.session_state.maxdiff_results)):
+        _mdec1, _mdec2 = st.columns([6, 1])
+        with _mdec1:
+            _mdexp = st.expander(f"\U0001f522 {res['name']} -- {res['n_tasks']} zestaw\u00f3w, {len(res['items'])} pozycji", expanded=True)
+        with _mdec2:
+            if st.button("\U0001f5d1\ufe0f", key=f"del_md_{_mdi}",
+                         help=f"Usu\u0144 {res['name']}"):
+                st.session_state.maxdiff_results.pop(_mdi)
+                st.rerun()
+        with _mdexp:
             df_s = res['scores']
             mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("N respondent\u00f3w", f"{res['n_resp']:,}")
+            mc1.metric("N respondent\u00f3w", f"{int(round(float(res['n_resp']))):,}")
             mc2.metric("Liczba zestaw\u00f3w", res['n_tasks'])
             mc3.metric("Pozycji", len(res['items']))
 
@@ -5609,6 +6125,14 @@ elif menu == "\U0001f3af Skupienia i Segmentacja":
                 value="Skupienie_H",
                 key="hc_varname"
             )
+            # Warn if the variable name is already used by an earlier hclust result
+            _existing_hc_names = {r.get('var_name') for r in st.session_state.hclust_results}
+            if hc_var_name.strip() in _existing_hc_names:
+                st.warning(
+                    f"\u26a0\ufe0f Nazwa `{hc_var_name.strip()}` jest ju\u017c u\u017cywana przez inn\u0105 "
+                    "analiz\u0119 skupie\u0144. Po wygenerowaniu nowej, **poprzedni wynik zostanie nadpisany**. "
+                    "Zmie\u0144 nazw\u0119, je\u015bli chcesz zachowa\u0107 obydwa wyniki."
+                )
 
         if st.button("\u25b6\ufe0f Generuj dendrogram i skupienia", type="primary", key="hc_run"):
             if len(hc_vars) < 2:
@@ -5706,17 +6230,37 @@ elif menu == "\U0001f3af Skupienia i Segmentacja":
                     'sizes': sizes_df,
                     'profile': cluster_means,
                     'Z': Z_full.tolist(),
+                    'standardize': hc_standardize,
+                    'labels_data': {str(i): int(lbl) for i, lbl in zip(idx_full, labels_full)},
                 }
-                st.session_state.hclust_results.append(result_entry)
+                _merge_result(st.session_state.hclust_results, result_entry,
+                    key_fn=lambda r: r.get('var_name',''))
                 st.success(f"\u2705 Skupienia hierarchiczne obliczone! Zmienna `{hc_var_name}` dodana do bazy.")
 
-        for res_hc in st.session_state.hclust_results:
-            with st.expander(
-                f"\U0001f333 {res_hc['var_name']} \u2014 {res_hc['n_clusters']} skupie\u0144 ({res_hc['method']})",
-                expanded=True
-            ):
+        if st.session_state.hclust_results:
+            _hcc1, _hcc2 = st.columns([5, 1])
+            _hcc1.markdown(f"**Zapisane skupienia hierarchiczne ({len(st.session_state.hclust_results)}):**")
+            with _hcc2:
+                if st.button("\U0001f5d1\ufe0f Usu\u0144 wszystkie", key="del_all_hc",
+                             use_container_width=True):
+                    st.session_state.hclust_results = []
+                    st.rerun()
+
+        for _hci, res_hc in enumerate(list(st.session_state.hclust_results)):
+            _hcec1, _hcec2 = st.columns([6, 1])
+            with _hcec1:
+                _hcexp = st.expander(
+                    f"\U0001f333 {res_hc['var_name']} \u2014 {res_hc['n_clusters']} skupie\u0144 ({res_hc['method']})",
+                    expanded=True
+                )
+            with _hcec2:
+                if st.button("\U0001f5d1\ufe0f", key=f"del_hc_{_hci}",
+                             help=f"Usu\u0144 {res_hc['var_name']}"):
+                    st.session_state.hclust_results.pop(_hci)
+                    st.rerun()
+            with _hcexp:
                 sc1, sc2, sc3 = st.columns(3)
-                sc1.metric("N obserwacji", f"{res_hc['n_obs']:,}")
+                sc1.metric("N obserwacji", f"{int(round(float(res_hc['n_obs']))):,}")
                 sc2.metric("Skupie\u0144", res_hc['n_clusters'])
                 sc3.metric("Metoda", res_hc['method'].title())
 
@@ -6066,9 +6610,19 @@ elif menu == "\U0001f4be Eksport do Excela":
         col1, col2 = st.columns(2)
         col1.info("**Baza z etykietami** -- warto\u015bci kod\u00f3w zast\u0105pione tekstem (np. 1 \u2192 'Kobieta').")
         col2.info("**Baza surowa** -- oryginalne warto\u015bci liczbowe. Wiersz 1: nazwy, Wiersz 2: etykiety.")
+
+        db_header_style = st.radio(
+            "Nag\u0142\u00f3wki kolumn:",
+            ["Nazwy zmiennych", "Etykiety zmiennych"],
+            key="db_header_style", horizontal=True,
+            help="Wybierz czy w pierwszym wierszu maj\u0105 znale\u017a\u0107 si\u0119 nazwy zmiennych "
+                 "(np. `Q1_1`) czy ich etykiety (np. `Jak oceniasz obs\u0142ug\u0119`)."
+        )
+
         if st.button("\U0001f4e5 Pobierz osobny plik z baz\u0105 danych", use_container_width=True):
             with st.spinner("Generowanie..."):
-                db_data = export_db_to_excel(df_raw, df, var_labels)
+                db_data = export_db_to_excel(df_raw, df, var_labels,
+                                              header_mode=("labels" if db_header_style == "Etykiety zmiennych" else "names"))
             fname = "Baza_Danych_Excel.xlsx" if is_excel else "Baza_Danych_SPSS.xlsx"
             st.download_button("\u2b07\ufe0f Pobierz " + fname, data=db_data,
                                file_name=fname,
@@ -6179,7 +6733,11 @@ elif menu == "\U0001f4be Eksport do Excela":
                         if st.session_state.conjoint_results:
                             valid_conj = [r for r in st.session_state.conjoint_results if not r.get('error')]
                             if valid_conj:
-                                export_conjoint_to_excel(writer, valid_conj, var_labels)
+                                export_conjoint_to_excel(
+                                    writer, valid_conj, var_labels,
+                                    meta_vvl=meta_orig.variable_value_labels if is_spss else {},
+                                    custom_val_labels=st.session_state.custom_val_labels
+                                )
                         if st.session_state.maxdiff_results:
                             export_maxdiff_to_excel(writer, st.session_state.maxdiff_results, var_labels)
 
@@ -6238,7 +6796,7 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
         st.divider()
         st.markdown("**Opcje prezentacji:**")
 
-        # \u2500\u2500 Szablon slajd\u00f3w \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # \u2500\u2500 Szablon slajd\u00f3w \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         pptx_template_file = st.file_uploader(
             "\U0001f4cb Szablon slajd\u00f3w (.pptx) \u2014 opcjonalny",
             type=["pptx"], key="ppt_template_file",
@@ -6247,10 +6805,222 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
         )
         if pptx_template_file:
             st.success("\u2705 Szablon slajd\u00f3w wczytany.")
-        _crtx_style = None  # crtx not used
+        _crtx_style = None
 
         st.divider()
-        oc1, oc2, oc3, oc4 = st.columns(4)
+
+        # \u2500\u2500 Chart template editor \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        _DEFAULT_CHART_TEMPLATE = {
+            "colors": ["#2E75B6", "#1F4E79", "#4472C4", "#A5A5A5", "#ED7D31",
+                       "#70AD47", "#FFC000", "#5B9BD5"],
+            "title_color": "#1F4E79",
+            "font_size_title": 14,
+            "font_size_labels": 10,
+            "font_size_data": 9,
+            "show_data_labels": True,
+            "data_label_format": "auto",   # auto/percent/number
+            "data_label_bold": True,
+            "legend_position": "bottom",   # top/bottom/right/left/none
+            "show_gridlines": False,
+            "show_y_axis": False,
+            "show_x_axis": True,
+            "bar_bold_labels": True,
+        }
+
+        with st.expander("\U0001f3a8 Szablony wykres\u00f3w \u2014 edytor", expanded=False):
+            st.caption("Zdefiniuj spos\u00f3b formatowania wykres\u00f3w (kolory, etykiety, legenda, siatka). "
+                       "Szablony zapisuj\u0105 si\u0119 w pliku projektu.")
+
+            tpl_sub1, tpl_sub2 = st.tabs([
+                "\u270f\ufe0f Edytor szablonu",
+                "\U0001f4cb Zapisane szablony"
+            ])
+
+            with tpl_sub1:
+                tpl_name = st.text_input("Nazwa szablonu:",
+                    placeholder="np. Brand Corporate / Prosty",
+                    key="tpl_editor_name")
+
+                # Load existing template for editing if name matches
+                _edit_base = st.session_state.ppt_chart_templates.get(tpl_name.strip(),
+                                                                       _DEFAULT_CHART_TEMPLATE.copy())
+
+                st.markdown("**\U0001f3a8 Paleta kolor\u00f3w (8):**")
+                color_cols = st.columns(4)
+                new_colors = []
+                for i in range(8):
+                    default_c = _edit_base.get("colors", _DEFAULT_CHART_TEMPLATE["colors"])[i] \
+                                if i < len(_edit_base.get("colors", [])) \
+                                else _DEFAULT_CHART_TEMPLATE["colors"][i]
+                    c = color_cols[i % 4].color_picker(f"Kolor {i+1}:",
+                        value=default_c, key=f"tpl_c_{i}")
+                    new_colors.append(c)
+
+                st.markdown("**\U0001f4dd Etykiety danych i typografia:**")
+                tc1, tc2, tc3 = st.columns(3)
+                with tc1:
+                    new_title_color = st.color_picker("Kolor tytu\u0142u / etykiet:",
+                        value=_edit_base.get("title_color", "#1F4E79"), key="tpl_title_color")
+                    new_font_data = st.number_input("Rozmiar etykiet danych (pt):",
+                        min_value=6, max_value=20, value=int(_edit_base.get("font_size_data", 9)),
+                        key="tpl_font_data")
+                with tc2:
+                    new_font_title = st.number_input("Rozmiar tytu\u0142u (pt):",
+                        min_value=8, max_value=32, value=int(_edit_base.get("font_size_title", 14)),
+                        key="tpl_font_title")
+                    new_font_labels = st.number_input("Rozmiar etykiet osi (pt):",
+                        min_value=6, max_value=20, value=int(_edit_base.get("font_size_labels", 10)),
+                        key="tpl_font_labels")
+                with tc3:
+                    new_show_dls = st.checkbox("Pokazuj etykiety danych",
+                        value=_edit_base.get("show_data_labels", True), key="tpl_show_dls")
+                    new_dls_bold = st.checkbox("Etykiety danych pogrubione",
+                        value=_edit_base.get("data_label_bold", True), key="tpl_dls_bold")
+
+                new_dls_fmt = st.radio("Format etykiet danych:",
+                    ["auto", "percent", "number"],
+                    format_func=lambda x: {"auto": "Auto (wg wykresu)",
+                                           "percent": "Zawsze procent (%)",
+                                           "number": "Zawsze liczba"}[x],
+                    index=["auto", "percent", "number"].index(
+                        _edit_base.get("data_label_format", "auto")),
+                    horizontal=True, key="tpl_dls_fmt")
+
+                st.markdown("**\U0001f4ca Legenda, osie i siatka:**")
+                lc1, lc2 = st.columns(2)
+                with lc1:
+                    new_legend_pos = st.selectbox("Pozycja legendy:",
+                        ["bottom", "top", "right", "left", "none"],
+                        format_func=lambda x: {"bottom": "D\u00f3\u0142",
+                                               "top": "G\u00f3ra",
+                                               "right": "Prawo",
+                                               "left": "Lewo",
+                                               "none": "Ukryj"}[x],
+                        index=["bottom", "top", "right", "left", "none"].index(
+                            _edit_base.get("legend_position", "bottom")),
+                        key="tpl_legend")
+                    new_show_y = st.checkbox("Poka\u017c o\u015b Y",
+                        value=_edit_base.get("show_y_axis", False), key="tpl_show_y")
+                with lc2:
+                    new_show_grid = st.checkbox("Poka\u017c linie siatki",
+                        value=_edit_base.get("show_gridlines", False), key="tpl_show_grid")
+                    new_show_x = st.checkbox("Poka\u017c o\u015b X",
+                        value=_edit_base.get("show_x_axis", True), key="tpl_show_x")
+
+                # Live preview
+                st.markdown("**\U0001f441\ufe0f Podgl\u0105d:**")
+                _preview_df = pd.DataFrame({
+                    "Kategoria": ["Grupa A", "Grupa B", "Grupa C", "Grupa D"],
+                    "Warto\u015b\u0107":  [45.2, 32.8, 15.0, 7.0]
+                })
+                _preview_fig = px.bar(_preview_df, x="Kategoria", y="Warto\u015b\u0107",
+                                       color_discrete_sequence=[new_colors[0]])
+                _ymax = float(_preview_df["Warto\u015b\u0107"].max()) * 1.25
+                _preview_fig.update_layout(
+                    height=320, margin=dict(l=10, r=10, t=40, b=40),
+                    showlegend=(new_legend_pos != "none"),
+                    xaxis=dict(visible=new_show_x, tickfont=dict(size=new_font_labels)),
+                    yaxis=dict(visible=new_show_y, showgrid=new_show_grid,
+                               tickfont=dict(size=new_font_labels),
+                               range=[0, _ymax]),
+                    plot_bgcolor="white"
+                )
+                if new_show_dls:
+                    _preview_fig.update_traces(
+                        text=[f"{v:.1f}%" for v in _preview_df["Warto\u015b\u0107"]],
+                        textposition="outside",
+                        textfont=dict(size=new_font_data, color=new_title_color)
+                    )
+                st.plotly_chart(_preview_fig, use_container_width=True,
+                                key="tpl_preview_chart")
+
+                # Save
+                bc1, bc2 = st.columns(2)
+                with bc1:
+                    if st.button("\U0001f4be Zapisz szablon",
+                                 type="primary", use_container_width=True,
+                                 key="tpl_save", disabled=(not tpl_name.strip())):
+                        st.session_state.ppt_chart_templates[tpl_name.strip()] = {
+                            "colors": new_colors,
+                            "title_color": new_title_color,
+                            "font_size_title": int(new_font_title),
+                            "font_size_labels": int(new_font_labels),
+                            "font_size_data": int(new_font_data),
+                            "show_data_labels": bool(new_show_dls),
+                            "data_label_format": new_dls_fmt,
+                            "data_label_bold": bool(new_dls_bold),
+                            "legend_position": new_legend_pos,
+                            "show_gridlines": bool(new_show_grid),
+                            "show_y_axis": bool(new_show_y),
+                            "show_x_axis": bool(new_show_x),
+                            "bar_bold_labels": True,
+                        }
+                        st.success(f"\u2705 Szablon `{tpl_name.strip()}` zapisany.")
+                        st.rerun()
+                with bc2:
+                    if (tpl_name.strip() in st.session_state.ppt_chart_templates
+                        and st.button("\U0001f5d1\ufe0f Usu\u0144",
+                                      use_container_width=True, key="tpl_del_current")):
+                        st.session_state.ppt_chart_templates.pop(tpl_name.strip(), None)
+                        st.rerun()
+
+            with tpl_sub2:
+                if not st.session_state.ppt_chart_templates:
+                    st.info("Brak zapisanych szablon\u00f3w. Przejd\u017a do zak\u0142adki "
+                            "**Edytor szablonu** aby utworzy\u0107.")
+                else:
+                    for tname, tdef in list(st.session_state.ppt_chart_templates.items()):
+                        with st.container(border=True):
+                            hdr_c1, hdr_c2 = st.columns([5, 1])
+                            hdr_c1.markdown(f"**\U0001f3a8 `{tname}`** \u2014 "
+                                            f"{len(tdef.get('colors', []))} kolor\u00f3w")
+                            with hdr_c2:
+                                if st.button("\U0001f5d1\ufe0f", key=f"tpl_del_{tname}",
+                                             help=f"Usu\u0144 szablon {tname}"):
+                                    st.session_state.ppt_chart_templates.pop(tname, None)
+                                    st.rerun()
+                            cols_disp = tdef.get('colors', [])
+                            sw = " ".join(
+                                f'<span style="display:inline-block;width:24px;height:24px;'
+                                f'background:{c};border:1px solid #ddd;margin-right:2px;'
+                                f'border-radius:3px;"></span>'
+                                for c in cols_disp
+                            )
+                            st.markdown(sw, unsafe_allow_html=True)
+                            st.caption(
+                                f"Legenda: {tdef.get('legend_position', 'bottom')} \u00b7 "
+                                f"Etykiety: {'tak' if tdef.get('show_data_labels') else 'nie'} \u00b7 "
+                                f"Siatka: {'tak' if tdef.get('show_gridlines') else 'nie'}"
+                            )
+
+        st.divider()
+
+        # \u2500\u2500 Selekcja szablonu dla cz\u0119sto\u015bci i krzy\u017cowych \u2500\u2500\u2500\u2500\u2500
+        _tpl_names = list(st.session_state.ppt_chart_templates.keys())
+        _tpl_options = ["(domy\u015blny)"] + _tpl_names
+
+        tsel_col1, tsel_col2 = st.columns(2)
+        with tsel_col1:
+            ppt_freq_tpl = st.selectbox(
+                "\U0001f4c8 Szablon dla cz\u0119sto\u015bci:",
+                _tpl_options, index=0, key="ppt_freq_tpl"
+            )
+        with tsel_col2:
+            ppt_cross_tpl = st.selectbox(
+                "\U0001f500 Szablon dla krzy\u017cowych:",
+                _tpl_options, index=0, key="ppt_cross_tpl"
+            )
+
+        def _get_tpl(name):
+            if name == "(domy\u015blny)" or name not in st.session_state.ppt_chart_templates:
+                return _DEFAULT_CHART_TEMPLATE
+            return st.session_state.ppt_chart_templates[name]
+
+        freq_tpl_def  = _get_tpl(ppt_freq_tpl)
+        cross_tpl_def = _get_tpl(ppt_cross_tpl)
+
+        st.divider()
+        oc1, oc2, oc3 = st.columns(3)
         with oc1:
             ppt_metric = st.radio(
                 "Warto\u015b\u0107 na wykresie:",
@@ -6268,22 +7038,27 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
                 "Poka\u017c baz\u0119 (N) w tytu\u0142ach",
                 value=True, key="ppt_base"
             )
-        with oc4:
-            _PALETTES = {
-                "Niebieski (domy\u015blny)": ("#2E75B6", "#1F4E79"),
-                "Zielony":                   ("#375623", "#1E3A12"),
-                "Czerwony":                  ("#C00000", "#7B0000"),
-                "Pomara\u0144czowy":         ("#E36C09", "#8E3F00"),
-                "Fioletowy":                 ("#7030A0", "#3D1960"),
-                "Szary (korporacyjny)":      ("#595959", "#262626"),
-                "Granatowy":                 ("#003087", "#001B55"),
-                "Z\u0142oty":               ("#C09000", "#7A5A00"),
-            }
-            ppt_palette_name = st.selectbox(
-                "Paleta kolor\u00f3w:",
-                list(_PALETTES.keys()), key="ppt_palette"
+
+        # \u2500\u2500 Motyw kolorystyczny prezentacji \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        tc1, tc2 = st.columns([1, 2])
+        with tc1:
+            _title_hex = st.color_picker(
+                "\U0001f3a8 Motyw kolorystyczny prezentacji:",
+                value="#1F4E79", key="ppt_theme_color",
+                help="Kolor paska z tytu\u0142em slajdu (dotyczy tylko prezentacji bez szablonu .pptx)."
             )
-            _bar_hex, _title_hex = _PALETTES[ppt_palette_name]
+        with tc2:
+            st.markdown(
+                f'<div style="margin-top:32px;display:inline-block;'
+                f'width:40px;height:30px;background:{_title_hex};'
+                f'border:1px solid #ccc;border-radius:4px;vertical-align:middle;"></div> '
+                f'<span style="margin-left:8px;line-height:30px;vertical-align:middle;">'
+                f'Wybrany kolor: <code>{_title_hex}</code></span>',
+                unsafe_allow_html=True
+            )
+
+        # bar color still comes from freq template's first color
+        _bar_hex = freq_tpl_def["colors"][0]
 
         st.divider()
         sel_freq_keys  = []
@@ -6459,10 +7234,14 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
                     except Exception:
                         pass
 
-                def _apply_dls(dls, color):
-                    """Apply data label style, respecting crtx font if available."""
-                    dls.show_value = True; dls.show_category_name = False
-                    dls.font.size = Pt(11); dls.font.bold = True
+                def _apply_dls(dls, color, tpl=None):
+                    """Apply data label style using template."""
+                    if tpl is None:
+                        tpl = _DEFAULT_CHART_TEMPLATE
+                    dls.show_value = bool(tpl.get("show_data_labels", True))
+                    dls.show_category_name = False
+                    dls.font.size = Pt(int(tpl.get("font_size_data", 9)))
+                    dls.font.bold = bool(tpl.get("data_label_bold", True))
                     dls.font.color.rgb = color
                     if _chart_font:
                         try:
@@ -6470,9 +7249,49 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
                         except Exception:
                             pass
 
+                def _apply_tpl_axes(chart, tpl, is_pct):
+                    """Apply axis, gridline and legend settings from template."""
+                    try:
+                        vax = chart.value_axis
+                        vax.has_major_gridlines = bool(tpl.get("show_gridlines", False))
+                        if not tpl.get("show_y_axis", False):
+                            vax.tick_labels.font.size = Pt(1)
+                            vax.tick_labels.font.color.rgb = RGBColor(0xFF,0xFF,0xFF)
+                            vax.format.line.color.rgb = RGBColor(0xFF,0xFF,0xFF)
+                        else:
+                            vax.tick_labels.font.size = Pt(int(tpl.get("font_size_labels", 10)))
+                        vax.tick_labels.number_format = "0.0%" if is_pct else "#,##0"
+                        vax.tick_labels.number_format_is_linked = False
+                    except Exception:
+                        pass
+                    try:
+                        cax = chart.category_axis
+                        if tpl.get("show_x_axis", True):
+                            cax.tick_labels.font.size = Pt(int(tpl.get("font_size_labels", 10)))
+                        else:
+                            cax.tick_labels.font.size = Pt(1)
+                            cax.tick_labels.font.color.rgb = RGBColor(0xFF,0xFF,0xFF)
+                    except Exception:
+                        pass
+                    # Legend
+                    _LEG_POS = {"bottom": 4, "top": 1, "right": 2, "left": 3}
+                    lp = tpl.get("legend_position", "bottom")
+                    if lp == "none":
+                        chart.has_legend = False
+                    else:
+                        chart.has_legend = True
+                        try:
+                            chart.legend.position = _LEG_POS.get(lp, 4)
+                            chart.legend.include_in_layout = False
+                            chart.legend.font.size = Pt(int(tpl.get("font_size_labels", 10)))
+                        except Exception:
+                            pass
+
                 def _add_chart_slide(prs, title_text, categories, values,
-                                     subtitle="", is_pct=False):
+                                     subtitle="", is_pct=False, tpl=None):
                     """Single-series frequency chart."""
+                    if tpl is None:
+                        tpl = _DEFAULT_CHART_TEMPLATE
                     slide, chart_top = _slide_base(title_text, subtitle)
 
                     cd = ChartData()
@@ -6492,33 +7311,44 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
                         cd
                     ).chart
 
-                    chart.has_legend = False; chart.has_title = False
+                    chart.has_title = False
                     series = chart.series[0]
                     series.format.fill.solid()
-                    series.format.fill.fore_color.rgb = BAR_COLOR
+                    series.format.fill.fore_color.rgb = _hex_to_rgb(tpl["colors"][0])
 
                     dls = series.data_labels
-                    _apply_dls(dls, TITLE_COLOR)
-                    dls.number_format = "0.0%" if is_pct else "#,##0"
+                    _apply_dls(dls, _hex_to_rgb(tpl.get("title_color", "#1F4E79")), tpl)
+                    # Format based on tpl.data_label_format
+                    _fmt = tpl.get("data_label_format", "auto")
+                    if _fmt == "percent" or (_fmt == "auto" and is_pct):
+                        dls.number_format = "0.0%"
+                    else:
+                        dls.number_format = "#,##0"
                     dls.number_format_is_linked = False
 
-                    _fmt_numfmt(chart, is_pct)
-                    chart.category_axis.tick_labels.font.size = Pt(10)
+                    # For freq charts legend is single-series \u2014 usually hide
+                    if tpl.get("legend_position", "bottom") == "none":
+                        chart.has_legend = False
+                    else:
+                        chart.has_legend = False  # single series \u2014 no legend
+                    _apply_tpl_axes(chart, tpl, is_pct)
 
                 def _add_cross_chart_slide(prs, title_text, categories,
-                                           series_dict, subtitle="", is_pct=False):
+                                           series_dict, subtitle="", is_pct=False, tpl=None):
                     """
                     Grouped column chart for cross-tabs.
                     categories  = row variable values (x-axis)
                     series_dict = {series_name: [values...]} one per column category
                     """
+                    if tpl is None:
+                        tpl = _DEFAULT_CHART_TEMPLATE
                     slide, chart_top = _slide_base(title_text, subtitle)
 
                     cd = ChartData()
                     cd.categories = [str(c)[:35] for c in categories]
 
                     ser_names = list(series_dict.keys())
-                    palette = _palette_series(len(ser_names), _bar_hex)
+                    tpl_colors = tpl.get("colors", _DEFAULT_CHART_TEMPLATE["colors"])
 
                     for sname, svals in series_dict.items():
                         clean = []
@@ -6536,28 +7366,23 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
                         cd
                     ).chart
 
-                    chart.has_legend = True
-                    chart.has_title  = False
-                    try:
-                        chart.legend.position = 4   # BOTTOM
-                        chart.legend.include_in_layout = False
-                        chart.legend.font.size = Pt(10)
-                    except Exception:
-                        pass
+                    chart.has_title = False
 
                     for i, series in enumerate(chart.series):
-                        c = palette[i % len(palette)]
+                        c_hex = tpl_colors[i % len(tpl_colors)]
                         series.format.fill.solid()
-                        series.format.fill.fore_color.rgb = c
+                        series.format.fill.fore_color.rgb = _hex_to_rgb(c_hex)
 
                         dls = series.data_labels
-                        _apply_dls(dls, TITLE_COLOR)
-                        dls.font.size = Pt(9)
-                        dls.number_format = "0.0%" if is_pct else "#,##0"
+                        _apply_dls(dls, _hex_to_rgb(tpl.get("title_color", "#1F4E79")), tpl)
+                        _fmt = tpl.get("data_label_format", "auto")
+                        if _fmt == "percent" or (_fmt == "auto" and is_pct):
+                            dls.number_format = "0.0%"
+                        else:
+                            dls.number_format = "#,##0"
                         dls.number_format_is_linked = False
 
-                    _fmt_numfmt(chart, is_pct)
-                    chart.category_axis.tick_labels.font.size = Pt(10)
+                    _apply_tpl_axes(chart, tpl, is_pct)
 
                 slides_added = 0
                 use_pct = (ppt_metric == "Procent [%]")
@@ -6605,7 +7430,7 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
                             sub = f"Warto\u015bci: {unit}"
 
                         _add_chart_slide(prs, f"{prefix}{lbl}"[:120],
-                                         cats, vals, sub, is_pct=use_pct)
+                                         cats, vals, sub, is_pct=use_pct, tpl=freq_tpl_def)
                         slides_added += 1
                     except Exception as _e:
                         st.warning(f"Pomini\u0119to '{var_name_key}': {_e}")
@@ -6656,7 +7481,7 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
                         sub = f"Warto\u015bci: {unit} | Serie = kategorie zmiennej w kolumnach"
 
                         _add_cross_chart_slide(prs, title_s, cats,
-                                               series_dict, sub, is_pct=use_pct)
+                                               series_dict, sub, is_pct=use_pct, tpl=cross_tpl_def)
                         slides_added += 1
                     except Exception as _e:
                         st.warning(f"Pomini\u0119to '{cross_key}': {_e}")
