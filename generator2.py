@@ -25,454 +25,8 @@ import statsmodels.api as sm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from factor_analyzer import FactorAnalyzer
 from factor_analyzer.factor_analyzer import calculate_kmo, calculate_bartlett_sphericity
-import sqlite3
-import hashlib
-import secrets
-import uuid
-import os
-import ipaddress
-import urllib.request
-import urllib.error
-import time
 
 st.set_page_config(page_title="System Analiz Openfield (SAO)", layout="wide", page_icon="\U0001f4ca")
-
-# =============================================================
-# PANEL ADMINISTRACYJNY -- baza danych i funkcje auth
-# =============================================================
-_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "sao_admin.db")
-
-_MODULE_KEYS = {
-    "dashboard":    "\U0001f3e0 Dashboard",
-    "project":      "\U0001f4c1 Projekt i S\u0142ownik",
-    "prep":         "\U0001f6e0\ufe0f Przygotowanie Danych",
-    "analyses":     "\U0001f4c8 Analizy i Tabele",
-    "regression":   "\U0001f4c9 Regresja",
-    "anova":        "\U0001f4ca ANOVA",
-    "normality":    "\U0001f4d0 Testy Normalno\u015bci",
-    "factor":       "\U0001f52c Analiza Czynnikowa",
-    "cluster":      "\U0001f3af Skupienia i Segmentacja",
-    "conjoint":     "\U0001f4ca Conjoint",
-    "maxdiff":      "\U0001f522 MaxDiff",
-    "wordcloud":    "\u2601\ufe0f Chmura S\u0142\u00f3w",
-    "export_excel": "\U0001f4be Eksport do Excela",
-    "export_pptx":  "\U0001f4ca Eksport do PowerPoint",
-    "admin":        "\U0001f512 Panel admina",
-}
-
-_LABEL_TO_KEY = {v: k for k, v in _MODULE_KEYS.items()}
-
-_DEFAULT_SETTINGS = {
-    "idle_timeout_minutes": "60",
-    "min_pw_length":        "10",
-    "max_fail_attempts":    "5",
-    "lockout_minutes":      "30",
-    "rate_limit_window":    "15",
-}
-
-
-def _init_db_schema(conn):
-    cur = conn.cursor()
-    cur.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            password_salt TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'user',
-            created_at TEXT NOT NULL,
-            created_by INTEGER,
-            is_active INTEGER NOT NULL DEFAULT 1,
-            expires_at TEXT,
-            must_change_password INTEGER NOT NULL DEFAULT 0,
-            failed_login_count INTEGER NOT NULL DEFAULT 0,
-            locked_until TEXT,
-            last_login_at TEXT,
-            email TEXT,
-            full_name TEXT
-        );
-        CREATE TABLE IF NOT EXISTS module_permissions (
-            user_id INTEGER NOT NULL,
-            module_key TEXT NOT NULL,
-            granted INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (user_id, module_key)
-        );
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            session_token TEXT UNIQUE,
-            ip_address TEXT,
-            user_agent TEXT,
-            geo_country TEXT,
-            geo_city TEXT,
-            started_at TEXT NOT NULL,
-            last_seen_at TEXT,
-            ended_at TEXT,
-            login_success INTEGER NOT NULL DEFAULT 0,
-            logout_reason TEXT,
-            attempted_username TEXT
-        );
-        CREATE TABLE IF NOT EXISTS activity_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            session_id INTEGER,
-            module TEXT,
-            action TEXT,
-            metadata_json TEXT,
-            created_at TEXT NOT NULL,
-            ip_address TEXT
-        );
-        CREATE TABLE IF NOT EXISTS audit_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            actor_user_id INTEGER,
-            target_user_id INTEGER,
-            event_type TEXT NOT NULL,
-            details_json TEXT,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS geo_cache (
-            ip_address TEXT PRIMARY KEY,
-            country TEXT,
-            city TEXT,
-            fetched_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        );
-        CREATE INDEX IF NOT EXISTS ix_activity_user      ON activity_log(user_id, created_at);
-        CREATE INDEX IF NOT EXISTS ix_activity_module    ON activity_log(module, created_at);
-        CREATE INDEX IF NOT EXISTS ix_sessions_user      ON sessions(user_id, started_at);
-        CREATE INDEX IF NOT EXISTS ix_sessions_active    ON sessions(ended_at);
-        CREATE INDEX IF NOT EXISTS ix_audit_target       ON audit_log(target_user_id, created_at);
-    """)
-    for k, v in _DEFAULT_SETTINGS.items():
-        cur.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v))
-    conn.commit()
-
-
-def _hash_password(pw, salt=None):
-    if salt is None:
-        salt = secrets.token_bytes(16)
-    elif isinstance(salt, str):
-        salt = bytes.fromhex(salt)
-    h = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 260000)
-    return h.hex(), salt.hex()
-
-
-def _verify_password(pw, stored_hash, stored_salt):
-    if not stored_hash or not stored_salt:
-        return False
-    h, _ = _hash_password(pw, stored_salt)
-    return secrets.compare_digest(h, stored_hash)
-
-
-def _now_iso():
-    return datetime.datetime.utcnow().replace(microsecond=0).isoformat()
-
-
-def _ensure_default_admin(conn):
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    if cur.fetchone()[0] == 0:
-        pw_hash, pw_salt = _hash_password("admin")
-        cur.execute(
-            """INSERT INTO users(username, password_hash, password_salt, role,
-                                 created_at, is_active, must_change_password)
-               VALUES (?, ?, ?, 'admin', ?, 1, 1)""",
-            ("admin", pw_hash, pw_salt, _now_iso()),
-        )
-        admin_id = cur.lastrowid
-        for mkey in _MODULE_KEYS.keys():
-            cur.execute(
-                "INSERT OR IGNORE INTO module_permissions(user_id, module_key, granted) VALUES (?, ?, 1)",
-                (admin_id, mkey),
-            )
-        cur.execute(
-            "INSERT INTO audit_log(actor_user_id, target_user_id, event_type, details_json, created_at) VALUES (?, ?, ?, ?, ?)",
-            (admin_id, admin_id, "bootstrap_admin", json.dumps({"note": "domyslne konto admin/admin"}), _now_iso()),
-        )
-        conn.commit()
-
-
-@st.cache_resource
-def get_db():
-    os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(_DB_PATH, check_same_thread=False, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    _init_db_schema(conn)
-    _ensure_default_admin(conn)
-    return conn
-
-
-def _get_setting(key, default=None):
-    try:
-        row = get_db().execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-        return row["value"] if row else default
-    except Exception:
-        return default
-
-
-def _set_setting(key, value):
-    get_db().execute(
-        "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, str(value)),
-    )
-
-
-def _get_setting_int(key, default):
-    try:
-        return int(_get_setting(key, str(default)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _get_client_ip():
-    try:
-        hdrs = st.context.headers
-        xff = (hdrs.get("X-Forwarded-For") or "").split(",")[0].strip()
-        if xff:
-            return xff
-        xri = hdrs.get("X-Real-IP")
-        if xri:
-            return xri.strip()
-    except Exception:
-        pass
-    return "127.0.0.1"
-
-
-def _get_user_agent():
-    try:
-        return (st.context.headers.get("User-Agent") or "")[:500]
-    except Exception:
-        return ""
-
-
-def _is_private_ip(ip):
-    try:
-        a = ipaddress.ip_address(ip)
-        return a.is_private or a.is_loopback or a.is_link_local or a.is_reserved
-    except ValueError:
-        return True
-
-
-def _geo_lookup(ip):
-    """Zwraca (country, city). Uzywa cache w DB. Dla prywatnych IP zwraca ("LAN", "sie\u0107 lokalna")."""
-    if not ip:
-        return (None, None)
-    if _is_private_ip(ip):
-        return ("LAN", "sie\u0107 lokalna")
-    conn = get_db()
-    row = conn.execute("SELECT country, city FROM geo_cache WHERE ip_address=?", (ip,)).fetchone()
-    if row:
-        return (row["country"], row["city"])
-    country, city = (None, None)
-    try:
-        req = urllib.request.Request(
-            "https://ipapi.co/" + ip + "/json/",
-            headers={"User-Agent": "SAO/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-            country = payload.get("country_name") or payload.get("country")
-            city    = payload.get("city")
-    except Exception:
-        country, city = (None, None)
-    conn.execute(
-        "INSERT OR REPLACE INTO geo_cache(ip_address, country, city, fetched_at) VALUES(?, ?, ?, ?)",
-        (ip, country, city, _now_iso()),
-    )
-    return (country, city)
-
-
-def _get_user_by_name(username):
-    return get_db().execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
-
-
-def _get_user_by_id(user_id):
-    return get_db().execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-
-
-def _load_user_perms(user_id, role):
-    if role == "admin":
-        return {k: True for k in _MODULE_KEYS.keys()}
-    rows = get_db().execute(
-        "SELECT module_key, granted FROM module_permissions WHERE user_id=?", (user_id,)
-    ).fetchall()
-    perms = {k: False for k in _MODULE_KEYS.keys()}
-    for r in rows:
-        perms[r["module_key"]] = bool(r["granted"])
-    perms["admin"] = False
-    return perms
-
-
-def _set_module_perm(user_id, module_key, granted, actor_id=None):
-    get_db().execute(
-        """INSERT INTO module_permissions(user_id, module_key, granted) VALUES(?, ?, ?)
-           ON CONFLICT(user_id, module_key) DO UPDATE SET granted=excluded.granted""",
-        (user_id, module_key, int(bool(granted))),
-    )
-    get_db().execute(
-        "INSERT INTO audit_log(actor_user_id, target_user_id, event_type, details_json, created_at) VALUES(?, ?, ?, ?, ?)",
-        (actor_id, user_id, "set_perm",
-         json.dumps({"module": module_key, "granted": bool(granted)}), _now_iso()),
-    )
-
-
-def _validate_password_policy(pw, username=""):
-    min_len = _get_setting_int("min_pw_length", 10)
-    if len(pw) < min_len:
-        return "Has\u0142o musi mie\u0107 co najmniej " + str(min_len) + " znak\u00f3w."
-    if not any(c.isdigit() for c in pw):
-        return "Has\u0142o musi zawiera\u0107 co najmniej jedn\u0105 cyfr\u0119."
-    if not any(c.isalpha() for c in pw):
-        return "Has\u0142o musi zawiera\u0107 co najmniej jedn\u0105 liter\u0119."
-    if username and username.lower() in pw.lower():
-        return "Has\u0142o nie mo\u017ce zawiera\u0107 nazwy u\u017cytkownika."
-    return None
-
-
-def _create_session(user_id, ip, user_agent, success=True, attempted_username=None, reason=None):
-    token = uuid.uuid4().hex
-    country, city = _geo_lookup(ip) if success else (None, None)
-    now = _now_iso()
-    cur = get_db().execute(
-        """INSERT INTO sessions(user_id, session_token, ip_address, user_agent,
-                                geo_country, geo_city, started_at, last_seen_at,
-                                login_success, logout_reason, attempted_username)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (user_id, token if success else None, ip, user_agent,
-         country, city, now, now if success else None,
-         1 if success else 0, reason, attempted_username),
-    )
-    return cur.lastrowid, token, country, city
-
-
-def _validate_session(token):
-    if not token:
-        return None
-    row = get_db().execute(
-        "SELECT * FROM sessions WHERE session_token=? AND ended_at IS NULL",
-        (token,),
-    ).fetchone()
-    return row
-
-
-def _end_session(session_id, reason="logout"):
-    get_db().execute(
-        "UPDATE sessions SET ended_at=?, logout_reason=?, session_token=NULL WHERE id=? AND ended_at IS NULL",
-        (_now_iso(), reason, session_id),
-    )
-
-
-def _touch_session(session_id):
-    get_db().execute("UPDATE sessions SET last_seen_at=? WHERE id=?", (_now_iso(), session_id))
-
-
-def _log_activity(module, action, metadata=None):
-    try:
-        uid = st.session_state.get("current_user_id")
-        sid = st.session_state.get("session_db_id")
-        ip  = st.session_state.get("current_user_ip") or _get_client_ip()
-        meta_json = None
-        if metadata is not None:
-            try:
-                meta_json = json.dumps(metadata, ensure_ascii=True, default=str)[:2000]
-            except Exception:
-                meta_json = None
-        get_db().execute(
-            """INSERT INTO activity_log(user_id, session_id, module, action, metadata_json, created_at, ip_address)
-               VALUES(?, ?, ?, ?, ?, ?, ?)""",
-            (uid, sid, module, action, meta_json, _now_iso(), ip),
-        )
-    except Exception:
-        pass
-
-
-def _tracked_button(label, module_key, action, **kwargs):
-    """Owijka na st.button ktora loguje klikniecie do activity_log."""
-    clicked = st.button(label, **kwargs)
-    if clicked:
-        _log_activity(module_key, action)
-    return clicked
-
-
-def _user_can_access(module_key):
-    if not st.session_state.get("authenticated"):
-        return False
-    if st.session_state.get("current_user_role") == "admin":
-        return True
-    perms = st.session_state.get("current_user_perms") or {}
-    return bool(perms.get(module_key, False))
-
-
-def _require_module_access(module_key):
-    if not _user_can_access(module_key):
-        st.error("\U0001f512 Brak uprawnie\u0144 do tego modu\u0142u. Skontaktuj si\u0119 z administratorem.")
-        st.stop()
-
-
-def _is_locked(user_row):
-    lu = user_row["locked_until"] if user_row else None
-    if not lu:
-        return False
-    try:
-        return datetime.datetime.fromisoformat(lu) > datetime.datetime.utcnow()
-    except Exception:
-        return False
-
-
-def _bump_failed_login(user_id):
-    max_fail = _get_setting_int("max_fail_attempts", 5)
-    lock_min = _get_setting_int("lockout_minutes", 30)
-    conn = get_db()
-    row = conn.execute("SELECT failed_login_count FROM users WHERE id=?", (user_id,)).fetchone()
-    new_count = (row["failed_login_count"] if row else 0) + 1
-    locked_until = None
-    if new_count >= max_fail:
-        locked_until = (datetime.datetime.utcnow() + datetime.timedelta(minutes=lock_min)).replace(microsecond=0).isoformat()
-    conn.execute(
-        "UPDATE users SET failed_login_count=?, locked_until=? WHERE id=?",
-        (new_count, locked_until, user_id),
-    )
-    return new_count, locked_until
-
-
-def _reset_failed_login(user_id):
-    get_db().execute(
-        "UPDATE users SET failed_login_count=0, locked_until=NULL, last_login_at=? WHERE id=?",
-        (_now_iso(), user_id),
-    )
-
-
-def _attempt_login(username, password, ip, user_agent):
-    """Zwraca (status, payload). status: 'ok'|'bad_credentials'|'locked'|'inactive'|'expired'."""
-    user = _get_user_by_name(username)
-    if not user:
-        _create_session(None, ip, user_agent, success=False,
-                        attempted_username=username, reason="unknown_user")
-        return ("bad_credentials", None)
-    if _is_locked(user):
-        return ("locked", user["locked_until"])
-    if not user["is_active"]:
-        return ("inactive", None)
-    if user["expires_at"]:
-        try:
-            if datetime.datetime.fromisoformat(user["expires_at"]) < datetime.datetime.utcnow():
-                return ("expired", user["expires_at"])
-        except Exception:
-            pass
-    if not _verify_password(password, user["password_hash"], user["password_salt"]):
-        _bump_failed_login(user["id"])
-        _create_session(user["id"], ip, user_agent, success=False,
-                        attempted_username=username, reason="bad_password")
-        return ("bad_credentials", None)
-    _reset_failed_login(user["id"])
-    session_id, token, country, city = _create_session(user["id"], ip, user_agent, success=True)
-    return ("ok", {"user": user, "session_id": session_id, "token": token,
-                   "country": country, "city": city})
 
 # =============================================================
 # LOGOWANIE
@@ -535,127 +89,6 @@ st.markdown("""
 
 </style>
 """, unsafe_allow_html=True)
-
-# =============================================================
-# GATE LOGOWANIA
-# =============================================================
-
-# Idle timeout + walidacja tokenu w DB (wykrywa force-logout z panelu admina)
-if st.session_state.get('authenticated'):
-    _lg_token = st.session_state.get('session_token')
-    _lg_db_sess = _validate_session(_lg_token)
-    if _lg_db_sess is None:
-        # Sesja zostala zakonieczona (force-logout lub invalid token)
-        st.session_state.clear()
-        st.warning("\U0001f512 Twoja sesja zosta\u0142a zako\u0144czona przez administratora. Zaloguj si\u0119 ponownie.")
-    else:
-        _lg_idle_timeout = _get_setting_int("idle_timeout_minutes", 60)
-        _lg_last_ts = st.session_state.get('last_activity_ts', time.time())
-        if time.time() - _lg_last_ts > _lg_idle_timeout * 60:
-            _end_session(_lg_db_sess["id"], "idle_timeout")
-            st.session_state.clear()
-            st.warning("\u23f0 Sesja wygas\u0142a z powodu bezczynno\u015bci. Zaloguj si\u0119 ponownie.")
-        else:
-            st.session_state.last_activity_ts = time.time()
-            _touch_session(_lg_db_sess["id"])
-
-# Gate: blokuj nieuprawniony dostep
-if not st.session_state.get('authenticated'):
-    _lg_ip = _get_client_ip()
-    _lg_ua = _get_user_agent()
-    _lgc1, _lgc2, _lgc3 = st.columns([1, 2, 1])
-    with _lgc2:
-        st.markdown("""
-<div style="text-align:center; padding:30px 0 10px 0;">
-  <span style="font-size:2.5rem;">\U0001f4ca</span><br>
-  <span style="font-size:1.4rem; font-weight:bold; color:#1F4E79;">System Analiz Openfield (SAO)</span><br>
-  <span style="color:#666; font-size:0.9rem;">Zaloguj si\u0119, aby kontynuowa\u0107</span>
-</div>""", unsafe_allow_html=True)
-        with st.form("lg_login_form"):
-            _lg_user_in = st.text_input("\U0001f464 Nazwa u\u017cytkownika", placeholder="login")
-            _lg_pass_in = st.text_input("\U0001f511 Has\u0142o", type="password", placeholder="has\u0142o")
-            _lg_btn = st.form_submit_button("\u25b6\ufe0f Zaloguj", type="primary",
-                                            use_container_width=True)
-        if _lg_btn:
-            if not _lg_user_in or not _lg_pass_in:
-                st.error("Podaj nazw\u0119 u\u017cytkownika i has\u0142o.")
-            else:
-                _lg_status, _lg_pl = _attempt_login(
-                    _lg_user_in.strip(), _lg_pass_in, _lg_ip, _lg_ua)
-                if _lg_status == "ok":
-                    _lg_u = _lg_pl["user"]
-                    st.session_state.authenticated         = True
-                    st.session_state.current_user_id       = _lg_u["id"]
-                    st.session_state.current_user_name     = _lg_u["username"]
-                    st.session_state.current_user_role     = _lg_u["role"]
-                    st.session_state.current_user_perms    = _load_user_perms(
-                        _lg_u["id"], _lg_u["role"])
-                    st.session_state.session_token         = _lg_pl["token"]
-                    st.session_state.session_db_id         = _lg_pl["session_id"]
-                    st.session_state.last_activity_ts      = time.time()
-                    st.session_state.must_change_password  = bool(_lg_u["must_change_password"])
-                    st.session_state.current_user_ip       = _lg_ip
-                    _log_activity("system", "login",
-                                  {"ip": _lg_ip, "country": _lg_pl.get("country")})
-                    st.rerun()
-                elif _lg_status == "locked":
-                    _lk_until = str(_lg_pl or "")[:16].replace("T", " ")
-                    st.error("\U0001f512 Konto zablokowane. Spr\u00f3buj ponownie po: "
-                             + _lk_until + " UTC")
-                elif _lg_status == "inactive":
-                    st.error("\u26d4 To konto jest nieaktywne. Skontaktuj si\u0119 z administratorem.")
-                elif _lg_status == "expired":
-                    _exp_dt = str(_lg_pl or "")[:10]
-                    st.error("\u23f3 Dost\u0119p wygas\u0142 (" + _exp_dt
-                             + "). Skontaktuj si\u0119 z administratorem.")
-                else:
-                    st.error("\u274c Nieprawid\u0142owa nazwa u\u017cytkownika lub has\u0142o.")
-    st.stop()
-
-# Zmiana hasla przy pierwszym logowaniu (must_change_password)
-if st.session_state.get('must_change_password'):
-    _lgc1, _lgc2, _lgc3 = st.columns([1, 2, 1])
-    with _lgc2:
-        st.warning("\U0001f511 Przed kontynuowaniem musisz ustawi\u0107 nowe has\u0142o.")
-        _cpw_uname = st.session_state.get("current_user_name", "")
-        _cpw_min = str(_get_setting_int("min_pw_length", 10))
-        with st.form("lg_change_pw_form"):
-            _cpw_old  = st.text_input("Aktualne has\u0142o", type="password")
-            _cpw_new1 = st.text_input("Nowe has\u0142o", type="password",
-                                      help="Min. " + _cpw_min + " znak\u00f3w, cyfra i litera")
-            _cpw_new2 = st.text_input("Powt\u00f3rz nowe has\u0142o", type="password")
-            _cpw_btn  = st.form_submit_button("\u2705 Zmie\u0144 has\u0142o", type="primary",
-                                              use_container_width=True)
-        if _cpw_btn:
-            _cpw_user = _get_user_by_name(_cpw_uname)
-            if not _cpw_user:
-                st.error("B\u0142\u0105d: nie znaleziono u\u017cytkownika.")
-            elif not _verify_password(_cpw_old, _cpw_user["password_hash"],
-                                      _cpw_user["password_salt"]):
-                st.error("\u274c Nieprawid\u0142owe aktualne has\u0142o.")
-            elif _cpw_new1 != _cpw_new2:
-                st.error("\u274c Nowe has\u0142a nie s\u0105 identyczne.")
-            else:
-                _cpw_err = _validate_password_policy(_cpw_new1, _cpw_uname)
-                if _cpw_err:
-                    st.error("\u274c " + _cpw_err)
-                else:
-                    _cpw_h, _cpw_s = _hash_password(_cpw_new1)
-                    get_db().execute(
-                        "UPDATE users SET password_hash=?, password_salt=?,"
-                        " must_change_password=0 WHERE id=?",
-                        (_cpw_h, _cpw_s, _cpw_user["id"]))
-                    get_db().execute(
-                        "INSERT INTO audit_log(actor_user_id, target_user_id,"
-                        " event_type, details_json, created_at) VALUES(?,?,?,?,?)",
-                        (_cpw_user["id"], _cpw_user["id"], "change_password",
-                         json.dumps({"reason": "first_login"}), _now_iso()))
-                    st.session_state.must_change_password = False
-                    _log_activity("system", "change_password",
-                                  {"reason": "first_login"})
-                    st.success("\u2705 Has\u0142o zmienione. Mo\u017cesz teraz u\u017cywa\u0107 aplikacji.")
-                    st.rerun()
-    st.stop()
 
 # -------------------------------------------------------------
 # FUNKCJE POMOCNICZE
@@ -2815,16 +2248,6 @@ def export_maxdiff_to_excel(writer, maxdiff_results, var_labels):
 
 # SESSION STATE
 # -------------------------------------------------------------
-if 'authenticated'          not in st.session_state: st.session_state.authenticated = False
-if 'current_user_id'        not in st.session_state: st.session_state.current_user_id = None
-if 'current_user_name'      not in st.session_state: st.session_state.current_user_name = ""
-if 'current_user_role'      not in st.session_state: st.session_state.current_user_role = ""
-if 'current_user_perms'     not in st.session_state: st.session_state.current_user_perms = {}
-if 'session_token'          not in st.session_state: st.session_state.session_token = None
-if 'session_db_id'          not in st.session_state: st.session_state.session_db_id = None
-if 'last_activity_ts'       not in st.session_state: st.session_state.last_activity_ts = time.time()
-if 'must_change_password'   not in st.session_state: st.session_state.must_change_password = False
-if 'current_user_ip'        not in st.session_state: st.session_state.current_user_ip = ""
 if 'mrs_sets'            not in st.session_state: st.session_state.mrs_sets = {}
 if 'matrix_sets'         not in st.session_state: st.session_state.matrix_sets = {}
 if 'matrix_results'      not in st.session_state: st.session_state.matrix_results = []
@@ -2948,18 +2371,13 @@ else:
     uploaded_file = None
     excel_file = st.sidebar.file_uploader("Plik Excel (.xlsx)", type=["xlsx", "xls"], label_visibility="collapsed")
 
-# Sprawdz czy aktualnie wybrane jest menu Panel admina (nie wymaga pliku)
-_is_admin_menu = (st.session_state.get("current_menu") == _MODULE_KEYS.get("admin"))
-_no_data_file  = (is_spss and uploaded_file is None) or (is_excel and excel_file is None)
-
-# ?? Stop if no file (admin moze pracowac bez pliku) ??????????
-if not _is_admin_menu:
-    if is_spss and uploaded_file is None:
-        st.info("\U0001f448 Wczytaj plik SPSS (.sav) lub Excel z paska bocznego, aby rozpocz\u0105\u0107 prac\u0119.")
-        st.stop()
-    if is_excel and excel_file is None:
-        st.info("\U0001f448 Wczytaj plik SPSS (.sav) lub Excel z paska bocznego, aby rozpocz\u0105\u0107 prac\u0119.")
-        st.stop()
+# ?? Stop if no file ???????????????????????????????????????????
+if is_spss and uploaded_file is None:
+    st.info("\U0001f448 Wczytaj plik SPSS (.sav) lub Excel z paska bocznego, aby rozpocz\u0105\u0107 prac\u0119.")
+    st.stop()
+if is_excel and excel_file is None:
+    st.info("\U0001f448 Wczytaj plik SPSS (.sav) lub Excel z paska bocznego, aby rozpocz\u0105\u0107 prac\u0119.")
+    st.stop()
 
 # ?? Excel: sheet selector (shown inline, above spinner) ???????
 if is_excel:
@@ -2982,33 +2400,26 @@ if is_excel:
         )
         st.session_state.excel_sheet = selected_sheet
 
-# Domyslne wartosci gdy admin bez pliku (nadpisane ponizej jesli plik jest)
-df_orig_raw = pd.DataFrame()
-df_orig     = pd.DataFrame()
-meta_orig   = ExcelMeta([])
-loaded_name = ""
-
-# ?? Load data (pomijane gdy admin bez pliku) ??????????????????
-if not (_is_admin_menu and _no_data_file):
-    with st.spinner("Wczytywanie i strukturyzowanie bazy..."):
-        if is_spss:
-            df_orig_raw, df_orig, meta_orig = load_spss_data(uploaded_file)
-            loaded_name = uploaded_file.name
-        else:
-            _overrides_json = json.dumps(st.session_state.excel_col_types, sort_keys=True)
-            _missing_json   = json.dumps(st.session_state.custom_missing, sort_keys=True)
-            df_orig_raw, df_orig, meta_orig = load_excel_data(
-                excel_file, selected_sheet,
-                col_type_overrides_json=_overrides_json,
-                custom_missing_json=_missing_json
-            )
-            loaded_name = excel_file.name
-            # Apply text\u2192numeric encoding maps as value labels (only for newly encoded cols)
-            _tnm = getattr(meta_orig, '_text_to_num_maps', {})
-            for _col, _lmap in _tnm.items():
-                if (_col not in st.session_state.custom_val_labels
-                        and _col not in st.session_state.user_cleared_val_labels):
-                    st.session_state.custom_val_labels[_col] = _lmap
+# ?? Load data ?????????????????????????????????????????????????
+with st.spinner("Wczytywanie i strukturyzowanie bazy..."):
+    if is_spss:
+        df_orig_raw, df_orig, meta_orig = load_spss_data(uploaded_file)
+        loaded_name = uploaded_file.name
+    else:
+        _overrides_json = json.dumps(st.session_state.excel_col_types, sort_keys=True)
+        _missing_json   = json.dumps(st.session_state.custom_missing, sort_keys=True)
+        df_orig_raw, df_orig, meta_orig = load_excel_data(
+            excel_file, selected_sheet,
+            col_type_overrides_json=_overrides_json,
+            custom_missing_json=_missing_json
+        )
+        loaded_name = excel_file.name
+        # Apply text\u2192numeric encoding maps as value labels (only for newly encoded cols)
+        _tnm = getattr(meta_orig, '_text_to_num_maps', {})
+        for _col, _lmap in _tnm.items():
+            if (_col not in st.session_state.custom_val_labels
+                    and _col not in st.session_state.user_cleared_val_labels):
+                st.session_state.custom_val_labels[_col] = _lmap
 
 df_raw = df_orig_raw.copy()
 df     = df_orig.copy()
@@ -3096,12 +2507,11 @@ all_options     = visible_columns + list(st.session_state.mrs_sets.keys()) + lis
 numeric_cols_raw = df_raw.select_dtypes(include=[np.number]).columns.tolist()
 numeric_cols     = [c for c in numeric_cols_raw if c not in hidden_cols and c in visible_columns]
 
-# Sidebar status (tylko gdy plik wczytany)
+# Sidebar status
 st.sidebar.markdown("---")
 n_rows, n_cols = len(df_raw), len(df_raw.columns)
-if loaded_name:
-    src_icon = "\U0001f4ca" if is_spss else "\U0001f4c8"
-    st.sidebar.success(f"{src_icon} **{loaded_name}**\n\n{n_rows:,} respondent\u00f3w \u00b7 {n_cols} zmiennych")
+src_icon = "\U0001f4ca" if is_spss else "\U0001f4c8"
+st.sidebar.success(f"{src_icon} **{loaded_name}**\n\n{n_rows:,} respondent\u00f3w \u00b7 {n_cols} zmiennych")
 
 if st.session_state.weights is not None:
     st.sidebar.markdown("---")
@@ -3110,36 +2520,30 @@ else:
     use_weights = False
 
 st.sidebar.markdown("---")
-
-# Sidebar: info o zalogowanym uzytkowniku + wylogowanie
-_sw_name  = st.session_state.get("current_user_name", "")
-_sw_role  = st.session_state.get("current_user_role", "")
-_sw_label = "Administrator" if _sw_role == "admin" else "U\u017cytkownik"
-st.sidebar.markdown(
-    "<div style='background:#E8F0FB;border-radius:6px;padding:6px 10px;"
-    "margin-bottom:6px;font-size:0.82rem;'>"
-    "<b>\U0001f464 " + _sw_name + "</b><br>"
-    "<span style='color:#555;'>" + _sw_label + "</span></div>",
-    unsafe_allow_html=True)
-if st.sidebar.button("\u21a9\ufe0f Wyloguj", key="sidebar_logout",
-                     use_container_width=True):
-    _sw_sid = st.session_state.get('session_db_id')
-    if _sw_sid:
-        _end_session(_sw_sid, "logout")
-    _log_activity("system", "logout", {"username": _sw_name})
-    st.session_state.clear()
-    st.rerun()
-
 st.sidebar.markdown("## \U0001f4cc Nawigacja")
 
-# Menu filtrowane wg uprawnien uzytkownika
-_MENU_ITEMS = [lbl for key, lbl in _MODULE_KEYS.items() if _user_can_access(key)]
+_MENU_ITEMS = [
+    "\U0001f3e0 Dashboard",
+    "\U0001f4c1 Projekt i S\u0142ownik",
+    "\U0001f6e0\ufe0f Przygotowanie Danych",
+    "\U0001f4c8 Analizy i Tabele",
+    "\U0001f4c9 Regresja",
+    "\U0001f4ca ANOVA",
+    "\U0001f4d0 Testy Normalno\u015bci",
+    "\U0001f52c Analiza Czynnikowa",
+    "\U0001f3af Skupienia i Segmentacja",
+    "\U0001f4ca Conjoint",
+    "\U0001f522 MaxDiff",
+    "\u2601\ufe0f Chmura S\u0142\u00f3w",
+    "\U0001f4be Eksport do Excela",
+    "\U0001f4ca Eksport do PowerPoint",
+]
 
 # Allow tile clicks to navigate by writing to session state
 if 'nav_to' not in st.session_state:
     st.session_state.nav_to = None
-if 'current_menu' not in st.session_state or st.session_state.current_menu not in _MENU_ITEMS:
-    st.session_state.current_menu = _MENU_ITEMS[0] if _MENU_ITEMS else ""
+if 'current_menu' not in st.session_state:
+    st.session_state.current_menu = _MENU_ITEMS[0]
 
 # If a tile was clicked, update current_menu then clear nav_to
 if st.session_state.nav_to and st.session_state.nav_to in _MENU_ITEMS:
@@ -3156,7 +2560,6 @@ menu = st.sidebar.radio("", _MENU_ITEMS,
 # DASHBOARD
 # =============================================================
 if menu == "\U0001f3e0 Dashboard":
-    _require_module_access("dashboard")
     n_rows, n_cols_db = len(df_raw), len(df_raw.columns)
 
     st.markdown(f"""
@@ -3293,7 +2696,6 @@ if menu == "\U0001f3e0 Dashboard":
 # MODUL 1: PROJEKT I SLOWNIK
 # -------------------------------------------------------------
 elif menu == "\U0001f4c1 Projekt i S\u0142ownik":
-    _require_module_access("project")
     module_header("\U0001f4c1", "Projekt i S\u0142ownik")
     tab_proj, tab_summary, tab_dict = st.tabs(["\u2699\ufe0f Projekt", "\U0001f4cb Podsumowanie Bazy", "\U0001f4d6 S\u0142ownik Zmiennych"])
 
@@ -3707,7 +3109,6 @@ elif menu == "\U0001f4c1 Projekt i S\u0142ownik":
 # MODU? 2: PRZYGOTOWANIE DANYCH
 # -------------------------------------------------------------
 elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
-    _require_module_access("prep")
     module_header("\U0001f6e0\ufe0f", "Przygotowanie Danych")
     # For Excel: add an extra tab for type overrides
     if is_excel:
@@ -3868,7 +3269,7 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
             else:
                 st.info("Brak warto\u015bci do rekodowania (zmienna pusta lub brak danych).")
 
-        if unique_vals and _tracked_button("\u2705 Utw\u00f3rz rekodowan\u0105 zmienn\u0105", "prep", "create_recoding", type="primary", use_container_width=True):
+        if unique_vals and st.button("\u2705 Utw\u00f3rz rekodowan\u0105 zmienn\u0105", type="primary", use_container_width=True):
             if not new_var_name.strip():
                 st.error("Podaj nazw\u0119 nowej zmiennej.")
             elif new_var_name.strip() in df_raw.columns:
@@ -4745,8 +4146,8 @@ Wagi i cele wa\u017cenia s\u0105 zapisywane w pliku projektu JSON \u2014 przy po
                         if not np.isclose(sum_w, 100.0, atol=0.1):
                             st.error(f"{get_var_display_name(wv, var_labels)}: suma = {sum_w:.1f}% (wymagane 100%)")
                             mod_valid = False
-                    if mod_valid and _tracked_button("\u2696\ufe0f Przelicz wagi z nowymi celami", "prep", "recalculate_weights", type="primary",
-                                                    key="reweight_btn"):
+                    if mod_valid and st.button("\u2696\ufe0f Przelicz wagi z nowymi celami", type="primary",
+                                               key="reweight_btn"):
                         st.session_state.weights = calculate_rim_weights(df, mod_targets)
                         st.session_state.weight_targets = mod_targets
                         st.success("\u2705 Wagi przeliczone!")
@@ -4781,7 +4182,7 @@ Wagi i cele wa\u017cenia s\u0105 zapisywane w pliku projektu JSON \u2014 przy po
                 if not np.isclose(sum_pct, 100.0, atol=0.1):
                     st.error(f"Suma = {sum_pct:.1f}%. Musi wynosi\u0107 100%!")
                     valid_targets = False
-            if valid_targets and _tracked_button("\u2696\ufe0f Oblicz wagi", "prep", "calculate_weights", type="primary", key="calc_weights"):
+            if valid_targets and st.button("\u2696\ufe0f Oblicz wagi", type="primary", key="calc_weights"):
                 st.session_state.weights = calculate_rim_weights(df, targets)
                 st.session_state.weight_targets = targets
                 st.success("\u2705 Wagi obliczone!")
@@ -4857,7 +4258,7 @@ Aktywny podzia\u0142 jest zapisywany w pliku projektu JSON \u2014 przy ponownym 
                  "Wszystkie analizy b\u0119d\u0105 podzielone na grupy wg jej warto\u015bci."
         )
 
-        if _tracked_button("\u2705 Zastosuj", "prep", "apply_split", type="primary", key="split_apply"):
+        if st.button("\u2705 Zastosuj", type="primary", key="split_apply"):
             new_val = None if split_choice == "(brak - pe\u0142na baza)" else split_choice
             st.session_state.split_var = new_val
             if new_val:
@@ -4888,7 +4289,6 @@ Aktywny podzia\u0142 jest zapisywany w pliku projektu JSON \u2014 przy ponownym 
 # MODU? 3: ANALIZY I TABELE
 # -------------------------------------------------------------
 elif menu == "\U0001f4c8 Analizy i Tabele":
-    _require_module_access("analyses")
     module_header("\U0001f4c8", "Analizy i Tabele")
     tab_freq, tab_matrix_an, tab_cross, tab_means, tab_desc, tab_corr = st.tabs([
         "\U0001f4c8 Cz\u0119sto\u015bci", "\U0001f522 Pytania Matrycowe", "\U0001f500 Tabele Krzy\u017cowe", "\U0001f4ca \u015arednie (T-Test)", "\U0001f522 Statystyki Opisowe", "\U0001f517 Korelacje"
@@ -4897,7 +4297,7 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
     with tab_freq:
         freq_vars = st.multiselect("Wybierz zmienne:", all_options, format_func=lambda x: get_var_display_name(x, var_labels))
         show_charts_freq = st.checkbox("\U0001f4ca Wy\u015bwietlaj wykresy", key="charts_freq")
-        if _tracked_button("\u25b6\ufe0f Generuj tablice cz\u0119sto\u015bci", "analyses", "freq_table", type="primary") and freq_vars:
+        if st.button("\u25b6\ufe0f Generuj tablice cz\u0119sto\u015bci", type="primary") and freq_vars:
             _w_full = st.session_state.weights if use_weights else np.ones(len(df_raw))
             for freq_var in freq_vars:
                 # Iterate over split groups (single iteration if no split)
@@ -5045,7 +4445,7 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
             with col_chart:
                 show_chart_mat = st.checkbox("\U0001f4ca Wy\u015bwietl wykres", key="chart_mat")
 
-            if _tracked_button("\u25b6\ufe0f Generuj tabele matrycowe", "analyses", "matrix_table", type="primary", key="gen_matrix"):
+            if st.button("\u25b6\ufe0f Generuj tabele matrycowe", type="primary", key="gen_matrix"):
                 _w_full = st.session_state.weights if use_weights else np.ones(len(df_raw))
                 for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
                         df, df_raw, var_labels, st.session_state.split_var, weights=_w_full):
@@ -5235,7 +4635,7 @@ Pozwala sprawdzi\u0107 czy istnieje zwi\u0105zek mi\u0119dzy dwiema zmiennymi ka
         do_cramer = c3.checkbox("\U0001f4cf V Kramera", help="Si\u0142a zwi\u0105zku: 0=brak, 0.1=s\u0142aby, 0.3=umiarkowany, 0.5+=silny")
         show_charts_cross = c4.checkbox("\U0001f4ca Wykresy")
 
-        if _tracked_button("\u25b6\ufe0f Generuj tabele krzy\u017cowe", "analyses", "crosstab", type="primary") and row_vars and col_vars:
+        if st.button("\u25b6\ufe0f Generuj tabele krzy\u017cowe", type="primary") and row_vars and col_vars:
             _w_full = st.session_state.weights if use_weights else np.ones(len(df_raw))
             for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
                     df, df_raw, var_labels, st.session_state.split_var, weights=_w_full):
@@ -5456,7 +4856,7 @@ Pozwala sprawdzi\u0107 czy istnieje zwi\u0105zek mi\u0119dzy dwiema zmiennymi ka
         with col1: mean_rows = st.multiselect("Zmienne ci\u0105g\u0142e (wiersze):", numeric_cols, format_func=lambda x: get_var_display_name(x, var_labels))
         with col2: mean_cols_sel = st.multiselect("Metryczka (kolumny):", all_options, format_func=lambda x: get_var_display_name(x, var_labels))
         do_means_sig = st.checkbox("\U0001f520 Oznacz istotne r\u00f3\u017cnice \u015brednich (T-Test 95%)")
-        if _tracked_button("\u25b6\ufe0f Generuj tabele \u015brednich", "analyses", "means_table", type="primary") and mean_rows and mean_cols_sel:
+        if st.button("\u25b6\ufe0f Generuj tabele \u015brednich", type="primary") and mean_rows and mean_cols_sel:
             _w_full = st.session_state.weights if use_weights else np.ones(len(df_raw))
             for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
                     df, df_raw, var_labels, st.session_state.split_var, weights=_w_full):
@@ -5564,7 +4964,7 @@ Pozwala sprawdzi\u0107 czy istnieje zwi\u0105zek mi\u0119dzy dwiema zmiennymi ka
             d_n_valid  = st.checkbox("N wa\u017cnych",         value=True,  key="ds_nvalid")
             d_n_miss   = st.checkbox("N brak\u00f3w",          value=True,  key="ds_nmiss")
 
-        if _tracked_button("\u25b6\ufe0f Generuj statystyki opisowe", "analyses", "descriptive_stats", type="primary") and desc_vars:
+        if st.button("\u25b6\ufe0f Generuj statystyki opisowe", type="primary") and desc_vars:
             try:
                 _w_full_desc = (st.session_state.weights if use_weights and st.session_state.weights is not None
                                 else None)
@@ -5697,7 +5097,7 @@ Pozwala sprawdzi\u0107 czy istnieje zwi\u0105zek mi\u0119dzy dwiema zmiennymi ka
                 help="Pary o warto\u015bci bezwzgl\u0119dnej korelacji \u2265 progu zostan\u0105 wyro\u017cnione kolorem i wy\u015bwietlone jako lista."
             )
 
-        if _tracked_button("\u25b6\ufe0f Oblicz korelacje", "analyses", "correlations", type="primary") and len(corr_vars) > 1:
+        if st.button("\u25b6\ufe0f Oblicz korelacje", type="primary") and len(corr_vars) > 1:
             try:
                 _w_full_corr = st.session_state.weights if use_weights else None
                 for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
@@ -5791,7 +5191,6 @@ Pozwala sprawdzi\u0107 czy istnieje zwi\u0105zek mi\u0119dzy dwiema zmiennymi ka
 # MODU? 4: REGRESJA
 # -------------------------------------------------------------
 elif menu == "\U0001f4c9 Regresja":
-    _require_module_access("regression")
     module_header("\U0001f4c9", "Regresja", "OLS (liniowa) i logistyczna (binarna/wielomianowa)")
     tab_ols, tab_log = st.tabs(["\U0001f4c9 OLS (liniowa)", "\U0001f4c9 Logistyczna"])
 
@@ -5856,7 +5255,7 @@ elif menu == "\U0001f4c9 Regresja":
             st.rerun()
 
         st.divider()
-        if _tracked_button("\u25b6\ufe0f Uruchom regresj\u0119", "regression", "run_ols", type="primary"):
+        if st.button("\u25b6\ufe0f Uruchom regresj\u0119", type="primary"):
             valid_blocks = [b for b in st.session_state.reg_blocks if b]
             if not valid_blocks:
                 st.error("Dodaj co najmniej jeden predyktor.")
@@ -5996,7 +5395,7 @@ Modeluje prawdopodobie\u0144stwo przynale\u017cno\u015bci do kategorii.
             log_dummy = st.checkbox("Automatycznie zakoduj zmienne kategoryczne (dummy coding)",
                                      value=True, key="log_dummy")
 
-        if _tracked_button("\u25b6\ufe0f Uruchom regresj\u0119 logistyczn\u0105", "regression", "run_logistic", type="primary", key="log_run"):
+        if st.button("\u25b6\ufe0f Uruchom regresj\u0119 logistyczn\u0105", type="primary", key="log_run"):
             if not log_indep:
                 st.error("Wybierz co najmniej jeden predyktor.")
             else:
@@ -6173,7 +5572,6 @@ Modeluje prawdopodobie\u0144stwo przynale\u017cno\u015bci do kategorii.
 # MODUL: TESTY NORMALNOSCI
 # =============================================================
 elif menu == "\U0001f4d0 Testy Normalno\u015bci":
-    _require_module_access("normality")
     module_header("\U0001f4d0", "Testy Normalno\u015bci",
                   "Sprawdzanie za\u0142o\u017cenia normalno\u015bci rozk\u0142adu \u2014 wymagane przed ANOVA, regresj\u0105 i innymi testami parametrycznymi")
 
@@ -6253,8 +5651,8 @@ za\u0142o\u017cenie wielu test\u00f3w parametrycznych: **t-testu, ANOVA, regresj
         norm_show_hist = st.checkbox("Histogram z krzywa normaln\u0105", value=True, key="norm_hist")
         norm_show_desc = st.checkbox("Statystyki opisowe (sko\u015bno\u015b\u0107, kurtoza)", value=True, key="norm_desc")
 
-    if _tracked_button("\u25b6\ufe0f Przeprowad\u017a testy normalno\u015bci", "normality", "run_normality", type="primary",
-                       key="norm_run") and norm_vars and norm_tests:
+    if st.button("\u25b6\ufe0f Przeprowad\u017a testy normalno\u015bci", type="primary",
+                 key="norm_run") and norm_vars and norm_tests:
         _w_full_norm = st.session_state.weights if use_weights else None
         for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
                 df, df_raw, var_labels, st.session_state.split_var, weights=_w_full_norm):
@@ -6437,7 +5835,6 @@ za\u0142o\u017cenie wielu test\u00f3w parametrycznych: **t-testu, ANOVA, regresj
 
 
 elif menu == "\U0001f4ca ANOVA":
-    _require_module_access("anova")
     module_header("\U0001f4ca", "ANOVA", "Jednoczynnikowa analiza wariancji z testem post-hoc Tukeya")
 
     with st.expander("\U0001f4d6 Jak wykona\u0107 i interpretowa\u0107 ANOVA -- kliknij aby rozwin\u0105\u0107", expanded=False):
@@ -6477,7 +5874,7 @@ p < 0.05 dla danej pary = ta para jest istotnie r\u00f3\u017cna.
     with col2:
         anova_grp = st.selectbox("\U0001f465 Czynnik grupuj\u0105cy (kategoryczna):", visible_columns, format_func=lambda x: get_var_display_name(x, var_labels))
 
-    if _tracked_button("\u25b6\ufe0f Uruchom ANOVA", "anova", "run_anova", type="primary"):
+    if st.button("\u25b6\ufe0f Uruchom ANOVA", type="primary"):
         with st.spinner("Obliczanie ANOVA..."):
             _w_full = st.session_state.weights if use_weights else None
             for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
@@ -6567,7 +5964,6 @@ p < 0.05 dla danej pary = ta para jest istotnie r\u00f3\u017cna.
 # MODU? 6: ANALIZA CZYNNIKOWA
 # -------------------------------------------------------------
 elif menu == "\U0001f52c Analiza Czynnikowa":
-    _require_module_access("factor")
     module_header("\U0001f52c", "Analiza Czynnikowa", "Eksploracyjna Analiza Czynnikowa (EFA)")
 
     with st.expander("\U0001f4d6 Jak wykona\u0107 i interpretowa\u0107 EFA -- kliknij aby rozwin\u0105\u0107", expanded=False):
@@ -6616,7 +6012,7 @@ Przyk\u0142ad: 15 pyta\u0144 o satysfakcj\u0119 mo\u017ce odzwierciedla\u0107 3 
 
         show_scree = st.checkbox("\U0001f4c8 Wykres osypiska (Scree Plot)")
 
-        if _tracked_button("\u25b6\ufe0f Uruchom analiz\u0119 czynnikow\u0105", "factor", "run_factor", type="primary"):
+        if st.button("\u25b6\ufe0f Uruchom analiz\u0119 czynnikow\u0105", type="primary"):
             with st.spinner("Obliczanie analizy czynnikowej..."):
                 _w_full = st.session_state.weights if use_weights else None
                 for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
@@ -6710,7 +6106,6 @@ Przyk\u0142ad: 15 pyta\u0144 o satysfakcj\u0119 mo\u017ce odzwierciedla\u0107 3 
 # MODUL: CONJOINT
 # =============================================================
 elif menu == "\U0001f4ca Conjoint":
-    _require_module_access("conjoint")
     module_header("\U0001f4ca", "Analiza Conjoint", "Rating-based (OLS) i CBC (Logit) \u2014 u\u017cyteczno\u015bci cz\u0105stkowe i wa\u017cno\u015b\u0107 atrybut\u00f3w")
 
     with st.expander("\U0001f4d6 Jak wykona\u0107 i interpretowa\u0107 -- kliknij aby rozwin\u0105\u0107", expanded=False):
@@ -6765,7 +6160,7 @@ Conjoint (analiza l\u0105czna) mierzy, jak poszczeg\u00f3lne cechy produktu wp\u
         else:
             st.info("Wybierz zmienn\u0105 binarny\u0105 wyboru (1=wybrany profil) i zmienne atrybut\u00f3w. Dane musz\u0105 by\u0107 w formacie long.")
 
-    if _tracked_button("\u25b6\ufe0f Uruchom analiz\u0119 Conjoint", "conjoint", "run_conjoint", type="primary"):
+    if st.button("\u25b6\ufe0f Uruchom analiz\u0119 Conjoint", type="primary"):
         if not conj_attrs:
             st.error("Wybierz co najmniej jeden atrybut.")
         else:
@@ -6884,7 +6279,6 @@ Conjoint (analiza l\u0105czna) mierzy, jak poszczeg\u00f3lne cechy produktu wp\u
 # MODUL: MAXDIFF
 # =============================================================
 elif menu == "\U0001f522 MaxDiff":
-    _require_module_access("maxdiff")
     module_header("\U0001f522", "MaxDiff", "Best-Worst Scaling \u2014 ranking wa\u017cno\u015bci element\u00f3w")
 
     with st.expander("\U0001f4d6 Jak wykona\u0107 i interpretowa\u0107 -- kliknij aby rozwin\u0105\u0107", expanded=False):
@@ -6987,7 +6381,7 @@ Przyk\u0142ad: `Zestaw1_Best`, `Zestaw1_Worst`, `Zestaw2_Best`, `Zestaw2_Worst`,
     st.markdown("##### 3. Nazwa analizy i uruchomienie")
     md_name = st.text_input("Nazwa analizy MaxDiff:", value="MaxDiff", key="md_name")
 
-    if _tracked_button("\u25b6\ufe0f Uruchom analiz\u0119 MaxDiff", "maxdiff", "run_maxdiff", type="primary"):
+    if st.button("\u25b6\ufe0f Uruchom analiz\u0119 MaxDiff", type="primary"):
         if not valid_pairs:
             st.error("Wybierz co najmniej jedn\u0105 par\u0119 kolumn Best/Worst.")
         elif len(md_items) < 2:
@@ -7080,7 +6474,6 @@ Przyk\u0142ad: `Zestaw1_Best`, `Zestaw1_Worst`, `Zestaw2_Best`, `Zestaw2_Worst`,
 # MODUL: SKUPIENIA HIERARCHICZNE
 # =============================================================
 elif menu == "\U0001f3af Skupienia i Segmentacja":
-    _require_module_access("cluster")
     module_header("\U0001f3af", "Skupienia i Segmentacja", "Skupienia hierarchiczne (dendrogram) i segmentacja K-Means")
     tab_hc, tab_kmeans = st.tabs(["\U0001f333 Skupienia Hierarchiczne", "\U0001f3af Segmentacja K-Means"])
 
@@ -7153,7 +6546,7 @@ elif menu == "\U0001f3af Skupienia i Segmentacja":
                     "Zmie\u0144 nazw\u0119, je\u015bli chcesz zachowa\u0107 obydwa wyniki."
                 )
 
-        if _tracked_button("\u25b6\ufe0f Generuj dendrogram i skupienia", "cluster", "run_hclust", type="primary", key="hc_run"):
+        if st.button("\u25b6\ufe0f Generuj dendrogram i skupienia", type="primary", key="hc_run"):
             if len(hc_vars) < 2:
                 st.error("Wybierz co najmniej 2 zmienne.")
             else:
@@ -7333,7 +6726,7 @@ elif menu == "\U0001f3af Skupienia i Segmentacja":
         seg_name = st.text_input("Nazwa zmiennej segmentacyjnej:",
                                   value=f"Segmentacja_{len(st.session_state.segmentations) + 1}",
                                   key="seg_name_mod")
-        if _tracked_button("\u25b6\ufe0f Wykonaj segmentacj\u0119 K-Means", "cluster", "run_kmeans", type="primary", key="seg_run_mod"):
+        if st.button("\u25b6\ufe0f Wykonaj segmentacj\u0119 K-Means", type="primary", key="seg_run_mod"):
             if len(seg_vars) < 2:
                 st.error("Wybierz co najmniej 2 zmienne.")
             else:
@@ -7379,7 +6772,6 @@ elif menu == "\U0001f3af Skupienia i Segmentacja":
 
 
 elif menu == "\u2601\ufe0f Chmura S\u0142\u00f3w":
-    _require_module_access("wordcloud")
     module_header("\u2601\ufe0f", "Chmura S\u0142\u00f3w", "Wizualizacja odpowiedzi otwartych \u2014 eksport PNG/JPG")
 
     # Check for wordcloud availability
@@ -7500,8 +6892,8 @@ elif menu == "\u2601\ufe0f Chmura S\u0142\u00f3w":
 
             st.divider()
 
-            if _tracked_button("\u25b6\ufe0f Generuj chmur\u0119 s\u0142\u00f3w", "wordcloud", "generate_wordcloud", type="primary",
-                               use_container_width=True, key="wc_generate"):
+            if st.button("\u25b6\ufe0f Generuj chmur\u0119 s\u0142\u00f3w", type="primary",
+                         use_container_width=True, key="wc_generate"):
 
                 for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
                         df, df_raw, var_labels, st.session_state.split_var, weights=None):
@@ -7698,7 +7090,6 @@ elif menu == "\u2601\ufe0f Chmura S\u0142\u00f3w":
 
 
 elif menu == "\U0001f4be Eksport do Excela":
-    _require_module_access("export_excel")
     module_header("\U0001f4be", "Eksport do Excela", "Raport analityczny, wykresy, baza danych, spis tre\u015bci")
 
     # \u2500\u2500 Separate standalone DB download (still available) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -7787,7 +7178,7 @@ elif menu == "\U0001f4be Eksport do Excela":
             help="Dodaje arkusz 'Baza surowa (numeryczna)' z oryginalnymi kodami liczbowymi.",
         )
 
-        if _tracked_button("\U0001f4ca Generuj pe\u0142ny raport analityczny", "export_excel", "generate_report", type="primary", use_container_width=True):
+        if st.button("\U0001f4ca Generuj pe\u0142ny raport analityczny", type="primary", use_container_width=True):
             with st.spinner("Generowanie pliku Excel... To mo\u017ce chwil\u0119 potrwa\u0107."):
                 output = io.BytesIO()
                 try:
@@ -7864,7 +7255,6 @@ elif menu == "\U0001f4be Eksport do Excela":
 # MODUL: EKSPORT DO POWERPOINT
 # =============================================================
 elif menu == "\U0001f4ca Eksport do PowerPoint":
-    _require_module_access("export_pptx")
     module_header("\U0001f4ca", "Eksport do PowerPoint", "Edytowalne wykresy kolumnowe z cz\u0119sto\u015bci i tabel krzy\u017cowych")
     st.info(
         "Generuje plik PowerPoint z edytowalnymi wykresami kolumnowymi. "
@@ -8714,523 +8104,5 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
                 st.error(f"B\u0142\u0105d generowania PowerPoint: {_ppt_err}")
                 st.exception(_ppt_err)
 
-# =============================================================
-# PANEL ADMINA
-# =============================================================
-elif menu == "\U0001f512 Panel admina":
-    _require_module_access("admin")
-    module_header("\U0001f512", "Panel admina",
-                  "Zarz\u0105dzanie u\u017cytkownikami, uprawnieniami i aktywno\u015bci\u0105")
-
-    _adm_me = st.session_state.get("current_user_id")
-
-    def _adm_gen_pw(length=12):
-        import random
-        _chars = string.ascii_letters + string.digits + "!@#%^&*"
-        return "".join(random.SystemRandom().choices(_chars, k=length))
-
-    (
-        _adm_tab_users, _adm_tab_perms, _adm_tab_sess,
-        _adm_tab_hist, _adm_tab_act, _adm_tab_stats, _adm_tab_cfg
-    ) = st.tabs([
-        "\U0001f464 U\u017cytkownicy",
-        "\U0001f510 Uprawnienia",
-        "\U0001f4f6 Aktywne sesje",
-        "\U0001f4cb Historia logowa\u0144",
-        "\U0001f4c8 Aktywno\u015b\u0107",
-        "\U0001f4ca Statystyki",
-        "\u2699\ufe0f Ustawienia",
-    ])
-
-    # ============================================================
-    # TAB 1 -- UZYTKOWNICY
-    # ============================================================
-    with _adm_tab_users:
-        st.markdown("### \u2795 Dodaj nowego u\u017cytkownika")
-        with st.form("adm_add_user_form", clear_on_submit=True):
-            _au_c1, _au_c2, _au_c3 = st.columns(3)
-            _au_username = _au_c1.text_input("Nazwa u\u017cytkownika *")
-            _au_role     = _au_c2.selectbox("Rola", ["user", "admin"])
-            _au_expires  = _au_c3.date_input(
-                "Wygasa (puste = bez limitu)", value=None)
-            _au_c4, _au_c5 = st.columns(2)
-            _au_pw_mode   = _au_c4.radio(
-                "Has\u0142o", ["Generuj losowe", "Wpisz r\u0119cznie"], horizontal=True)
-            _au_pw_custom = _au_c5.text_input(
-                "Has\u0142o (je\u015bli r\u0119czne)", type="password")
-            _au_mcp = st.checkbox(
-                "Wymu\u015b zmian\u0119 has\u0142a przy pierwszym logowaniu", value=True)
-            _au_sub = st.form_submit_button(
-                "\u2795 Utw\u00f3rz u\u017cytkownika", type="primary")
-
-        if _au_sub:
-            _au_uname_clean = (_au_username or "").strip().lower()
-            if not _au_uname_clean:
-                st.error("Podaj nazw\u0119 u\u017cytkownika.")
-            elif _get_user_by_name(_au_uname_clean):
-                st.error("U\u017cytkownik '" + _au_uname_clean + "' ju\u017c istnieje.")
-            else:
-                _au_pw_final = _adm_gen_pw() if _au_pw_mode == "Generuj losowe" else _au_pw_custom
-                _au_pw_err = None if _au_mcp else _validate_password_policy(_au_pw_final, _au_uname_clean)
-                if not _au_pw_final:
-                    st.error("Podaj has\u0142o lub wybierz generowanie losowe.")
-                elif _au_pw_err:
-                    st.error("\u274c " + _au_pw_err)
-                else:
-                    _au_h, _au_s = _hash_password(_au_pw_final)
-                    _au_exp_str = _au_expires.isoformat() if _au_expires else None
-                    _au_new_id = get_db().execute(
-                        "INSERT INTO users(username,password_hash,password_salt,role,"
-                        "created_at,created_by,is_active,expires_at,must_change_password)"
-                        " VALUES(?,?,?,?,?,?,1,?,?)",
-                        (_au_uname_clean, _au_h, _au_s, _au_role,
-                         _now_iso(), _adm_me, _au_exp_str, int(_au_mcp))
-                    ).lastrowid
-                    if _au_role == "admin":
-                        for _mk in _MODULE_KEYS.keys():
-                            get_db().execute(
-                                "INSERT OR IGNORE INTO module_permissions"
-                                "(user_id,module_key,granted) VALUES(?,?,1)",
-                                (_au_new_id, _mk))
-                    get_db().execute(
-                        "INSERT INTO audit_log(actor_user_id,target_user_id,"
-                        "event_type,details_json,created_at) VALUES(?,?,?,?,?)",
-                        (_adm_me, _au_new_id, "create_user",
-                         json.dumps({"username": _au_uname_clean, "role": _au_role}),
-                         _now_iso()))
-                    _au_ok_msg = "\u2705 Utworzono u\u017cytkownika **" + _au_uname_clean + "**"
-                    if _au_pw_mode == "Generuj losowe":
-                        _au_ok_msg += "\n\n**Has\u0142o (skopiuj teraz!):** `" + _au_pw_final + "`"
-                    st.success(_au_ok_msg)
-                    st.rerun()
-
-        st.markdown("---")
-        st.markdown("### \U0001f464 Lista u\u017cytkownik\u00f3w")
-        _au_all = get_db().execute(
-            "SELECT id,username,role,is_active,expires_at,last_login_at,"
-            "failed_login_count,locked_until,must_change_password FROM users"
-            " ORDER BY role DESC,username"
-        ).fetchall()
-
-        for _au_row in _au_all:
-            _au_uid   = _au_row["id"]
-            _au_ud    = _au_row["username"]
-            _au_act   = bool(_au_row["is_active"])
-            _au_lkd   = _is_locked(_au_row)
-            _au_exp_v = _au_row["expires_at"] or "bez limitu"
-            _au_ll    = (_au_row["last_login_at"] or "\u2014")[:16].replace("T", " ")
-            _au_ic    = "\U0001f7e2" if (_au_act and not _au_lkd) else ("\U0001f534" if _au_lkd else "\u26ab")
-            _au_rb    = " [admin]" if _au_row["role"] == "admin" else " [user]"
-            _au_mb    = " \U0001f511" if _au_row["must_change_password"] else ""
-            with st.expander(
-                _au_ic + " " + _au_ud + _au_rb + _au_mb
-                + "   ostatnie log.: " + _au_ll, expanded=False
-            ):
-                _au_a1, _au_a2, _au_a3, _au_a4 = st.columns(4)
-                # Aktywacja/deaktywacja
-                if _au_act:
-                    if _au_a1.button("\u26ab Dezaktywuj", key="adm_deact_" + str(_au_uid)):
-                        get_db().execute("UPDATE users SET is_active=0 WHERE id=?", (_au_uid,))
-                        get_db().execute(
-                            "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
-                            "details_json,created_at) VALUES(?,?,?,?,?)",
-                            (_adm_me, _au_uid, "deactivate",
-                             json.dumps({"username": _au_ud}), _now_iso()))
-                        st.rerun()
-                else:
-                    if _au_a1.button("\U0001f7e2 Aktywuj", key="adm_act_" + str(_au_uid)):
-                        get_db().execute("UPDATE users SET is_active=1 WHERE id=?", (_au_uid,))
-                        get_db().execute(
-                            "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
-                            "details_json,created_at) VALUES(?,?,?,?,?)",
-                            (_adm_me, _au_uid, "activate",
-                             json.dumps({"username": _au_ud}), _now_iso()))
-                        st.rerun()
-                # Odblokowanie
-                if _au_lkd:
-                    if _au_a2.button("\U0001f513 Odblokuj", key="adm_unlock_" + str(_au_uid)):
-                        get_db().execute(
-                            "UPDATE users SET failed_login_count=0,locked_until=NULL WHERE id=?",
-                            (_au_uid,))
-                        get_db().execute(
-                            "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
-                            "details_json,created_at) VALUES(?,?,?,?,?)",
-                            (_adm_me, _au_uid, "unlock",
-                             json.dumps({"username": _au_ud}), _now_iso()))
-                        st.rerun()
-                # Reset hasla
-                if _au_a3.button("\U0001f504 Reset has\u0142a", key="adm_rpw_" + str(_au_uid)):
-                    _au_npw = _adm_gen_pw()
-                    _au_nh, _au_ns = _hash_password(_au_npw)
-                    get_db().execute(
-                        "UPDATE users SET password_hash=?,password_salt=?,"
-                        "must_change_password=1 WHERE id=?",
-                        (_au_nh, _au_ns, _au_uid))
-                    get_db().execute(
-                        "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
-                        "details_json,created_at) VALUES(?,?,?,?,?)",
-                        (_adm_me, _au_uid, "reset_password",
-                         json.dumps({"username": _au_ud}), _now_iso()))
-                    st.success("Nowe has\u0142o **" + _au_ud + "**: `" + _au_npw + "`")
-                # Usuwanie (tylko innych)
-                if _au_uid != _adm_me:
-                    if _au_a4.button("\U0001f5d1\ufe0f Usu\u0144",
-                                     key="adm_del_" + str(_au_uid)):
-                        get_db().execute("DELETE FROM users WHERE id=?", (_au_uid,))
-                        get_db().execute(
-                            "DELETE FROM module_permissions WHERE user_id=?", (_au_uid,))
-                        get_db().execute(
-                            "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
-                            "details_json,created_at) VALUES(?,?,?,?,?)",
-                            (_adm_me, _au_uid, "delete_user",
-                             json.dumps({"username": _au_ud}), _now_iso()))
-                        st.success("U\u017cytkownik **" + _au_ud + "** usuni\u0119ty.")
-                        st.rerun()
-                # Edycja daty wygasniecia
-                st.caption("Wygasa: " + str(_au_exp_v))
-                _au_ne, _au_ec1, _au_ec2 = st.columns([2, 1, 1])
-                _au_new_exp = _au_ne.date_input(
-                    "Nowa data wygasni\u0119cia", value=None,
-                    key="adm_exp_" + str(_au_uid))
-                if _au_ec1.button("Ustaw", key="adm_setexp_" + str(_au_uid)):
-                    _au_ev = _au_new_exp.isoformat() if _au_new_exp else None
-                    get_db().execute(
-                        "UPDATE users SET expires_at=? WHERE id=?", (_au_ev, _au_uid))
-                    get_db().execute(
-                        "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
-                        "details_json,created_at) VALUES(?,?,?,?,?)",
-                        (_adm_me, _au_uid, "set_expires",
-                         json.dumps({"username": _au_ud, "expires_at": _au_ev}),
-                         _now_iso()))
-                    st.success("Zaktualizowano dat\u0119 wygasni\u0119cia.")
-                    st.rerun()
-                if _au_ec2.button("Usu\u0144 limit", key="adm_delexp_" + str(_au_uid)):
-                    get_db().execute(
-                        "UPDATE users SET expires_at=NULL WHERE id=?", (_au_uid,))
-                    get_db().execute(
-                        "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
-                        "details_json,created_at) VALUES(?,?,?,?,?)",
-                        (_adm_me, _au_uid, "remove_expires",
-                         json.dumps({"username": _au_ud}), _now_iso()))
-                    st.success("Usuni\u0119to limit czasu.")
-                    st.rerun()
-
-    # ============================================================
-    # TAB 2 -- UPRAWNIENIA
-    # ============================================================
-    with _adm_tab_perms:
-        st.markdown("### \U0001f510 Matryca uprawnie\u0144 (bez kont admin \u2014 maj\u0105 pe\u0142ny dost\u0119p)")
-        _prm_users = get_db().execute(
-            "SELECT id,username FROM users WHERE role='user' AND is_active=1"
-            " ORDER BY username"
-        ).fetchall()
-        if not _prm_users:
-            st.info("Brak aktywnych u\u017cytkownik\u00f3w z rol\u0105 'user'.")
-        else:
-            _prm_mod_keys = [k for k in _MODULE_KEYS.keys() if k != "admin"]
-            _prm_mod_short = {
-                "dashboard":    "Dashboard", "project":    "Projekt",
-                "prep":         "Przygot.",  "analyses":   "Analizy",
-                "regression":   "Regresja",  "anova":      "ANOVA",
-                "normality":    "Normalno\u015b\u0107", "factor": "Czynnikowa",
-                "cluster":      "Skupienia", "conjoint":   "Conjoint",
-                "maxdiff":      "MaxDiff",   "wordcloud":  "Chmura S\u0142\u00f3w",
-                "export_excel": "Excel",     "export_pptx":"PPT",
-            }
-            _prm_rows = []
-            _prm_uid_map = {}
-            for _pu in _prm_users:
-                _pu_prms = {
-                    r["module_key"]: bool(r["granted"])
-                    for r in get_db().execute(
-                        "SELECT module_key,granted FROM module_permissions WHERE user_id=?",
-                        (_pu["id"],)).fetchall()
-                }
-                _prm_row = {_prm_mod_short.get(k, k): _pu_prms.get(k, False)
-                            for k in _prm_mod_keys}
-                _prm_row["__user__"] = _pu["username"]
-                _prm_rows.append(_prm_row)
-                _prm_uid_map[_pu["username"]] = _pu["id"]
-
-            _prm_df = pd.DataFrame(_prm_rows).set_index("__user__")
-            _prm_edited = st.data_editor(
-                _prm_df, use_container_width=True, key="adm_perm_editor",
-                column_config={c: st.column_config.CheckboxColumn(c)
-                               for c in _prm_df.columns},
-            )
-            if st.button("\U0001f4be Zapisz uprawnienia", type="primary",
-                         key="adm_save_perms"):
-                for _pu_name, _pu_row in _prm_edited.iterrows():
-                    _pu_id = _prm_uid_map.get(_pu_name)
-                    if not _pu_id:
-                        continue
-                    for _sh_key, _granted in _pu_row.items():
-                        _mk = next(
-                            (k for k, v in _prm_mod_short.items() if v == _sh_key), None)
-                        if _mk:
-                            _set_module_perm(_pu_id, _mk, bool(_granted), _adm_me)
-                    # Odswierz uprawnienia w session_state jesli to biezacy user
-                    if _pu_id == st.session_state.get("current_user_id"):
-                        st.session_state.current_user_perms = _load_user_perms(
-                            _pu_id, "user")
-                st.success("\u2705 Uprawnienia zapisane.")
-                st.rerun()
-
-    # ============================================================
-    # TAB 3 -- AKTYWNE SESJE
-    # ============================================================
-    with _adm_tab_sess:
-        st.markdown("### \U0001f4f6 Aktywne sesje")
-        _sess_idle = _get_setting_int("idle_timeout_minutes", 60)
-        _sess_cutoff = (
-            datetime.datetime.utcnow() - datetime.timedelta(minutes=_sess_idle)
-        ).replace(microsecond=0).isoformat()
-        _sess_rows = get_db().execute(
-            "SELECT s.id,s.session_token,s.ip_address,s.geo_country,s.geo_city,"
-            "s.started_at,s.last_seen_at,u.username"
-            " FROM sessions s JOIN users u ON s.user_id=u.id"
-            " WHERE s.ended_at IS NULL AND s.login_success=1"
-            " AND s.last_seen_at > ?"
-            " ORDER BY s.last_seen_at DESC",
-            (_sess_cutoff,)
-        ).fetchall()
-        if not _sess_rows:
-            st.info("Brak aktywnych sesji.")
-        else:
-            for _sr in _sess_rows:
-                _sr_geo = (((_sr["geo_city"] or "") + ", " + (_sr["geo_country"] or "")).strip(", ") or "?")
-                _sr_start = (_sr["started_at"] or "")[:16].replace("T", " ")
-                _sr_last  = (_sr["last_seen_at"] or "")[:16].replace("T", " ")
-                _sc1, _sc2 = st.columns([4, 1])
-                _sc1.markdown(
-                    "**" + _sr["username"] + "** \u2014 IP: `"
-                    + (_sr["ip_address"] or "?") + "` \u2014 Geo: "
-                    + _sr_geo + "  \n"
-                    "\U0001f4c5 Start: " + _sr_start
-                    + "  \u23f0 Ostatnia aktywno\u015b\u0107: " + _sr_last
-                )
-                if _sc2.button("\u21a9\ufe0f Wyloguj",
-                               key="adm_fs_" + str(_sr["id"])):
-                    _end_session(_sr["id"], "admin_force_logout")
-                    get_db().execute(
-                        "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
-                        "details_json,created_at) VALUES(?,?,?,?,?)",
-                        (_adm_me, None, "force_logout",
-                         json.dumps({"username": _sr["username"],
-                                     "session_id": _sr["id"]}),
-                         _now_iso()))
-                    st.success("Sesja u\u017cytkownika **" + _sr["username"] + "** zako\u0144czona.")
-                    st.rerun()
-                st.markdown("---")
-
-    # ============================================================
-    # TAB 4 -- HISTORIA LOGOWAN
-    # ============================================================
-    with _adm_tab_hist:
-        st.markdown("### \U0001f4cb Historia logowa\u0144")
-        _hst_c1, _hst_c2, _hst_c3 = st.columns(3)
-        _hst_user_filter = _hst_c1.text_input(
-            "Filtruj u\u017cytkownika", placeholder="wszystkie", key="adm_hf_user")
-        _hst_only_fail = _hst_c2.checkbox("Tylko nieudane", key="adm_hf_fail")
-        _hst_limit = _hst_c3.selectbox("Max wierszy", [50, 100, 250, 500], key="adm_hf_lim")
-        _hst_where = "WHERE 1=1"
-        _hst_params = []
-        if _hst_user_filter:
-            _hst_where += " AND (u.username LIKE ? OR s.attempted_username LIKE ?)"
-            _hst_params += ["%" + _hst_user_filter + "%", "%" + _hst_user_filter + "%"]
-        if _hst_only_fail:
-            _hst_where += " AND s.login_success=0"
-        _hst_q = (
-            "SELECT s.started_at,s.login_success,s.ip_address,s.geo_country,s.geo_city,"
-            "s.logout_reason,s.attempted_username,u.username"
-            " FROM sessions s LEFT JOIN users u ON s.user_id=u.id " + _hst_where
-            + " ORDER BY s.started_at DESC LIMIT ?"
-        )
-        _hst_rows = get_db().execute(_hst_q, _hst_params + [_hst_limit]).fetchall()
-        if not _hst_rows:
-            st.info("Brak rekord\u00f3w spe\u0142niaj\u0105cych kryteria.")
-        else:
-            _hst_data = []
-            for _hr in _hst_rows:
-                _hst_uname = _hr["username"] or _hr["attempted_username"] or "?"
-                _hst_geo = (((_hr["geo_city"] or "") + " " + (_hr["geo_country"] or "")).strip() or "?")
-                _hst_data.append({
-                    "Czas (UTC)":   (_hr["started_at"] or "")[:16].replace("T", " "),
-                    "U\u017cytkownik": _hst_uname,
-                    "Wynik":        "\u2705 OK" if _hr["login_success"] else "\u274c B\u0142\u0105d",
-                    "IP":           _hr["ip_address"] or "?",
-                    "Lokalizacja":  _hst_geo,
-                    "Pow\u00f3d":   _hr["logout_reason"] or "",
-                })
-            st.dataframe(pd.DataFrame(_hst_data), use_container_width=True, hide_index=True)
-
-    # ============================================================
-    # TAB 5 -- AKTYWNOSC
-    # ============================================================
-    with _adm_tab_act:
-        st.markdown("### \U0001f4c8 Log aktywno\u015bci analiz")
-        _act_c1, _act_c2, _act_c3 = st.columns(3)
-        _act_uf  = _act_c1.text_input(
-            "U\u017cytkownik", placeholder="wszyscy", key="adm_af_user")
-        _act_mf  = _act_c2.selectbox(
-            "Modu\u0142", ["-- wszystkie --"] + list(_MODULE_KEYS.keys()),
-            key="adm_af_mod")
-        _act_lim = _act_c3.selectbox(
-            "Max wierszy", [100, 250, 500, 1000], key="adm_af_lim")
-        _act_where = "WHERE 1=1"
-        _act_params = []
-        if _act_uf:
-            _act_where += " AND u.username LIKE ?"
-            _act_params.append("%" + _act_uf + "%")
-        if _act_mf != "-- wszystkie --":
-            _act_where += " AND a.module=?"
-            _act_params.append(_act_mf)
-        _act_rows = get_db().execute(
-            "SELECT a.created_at,a.module,a.action,a.ip_address,a.metadata_json,"
-            "u.username FROM activity_log a"
-            " LEFT JOIN users u ON a.user_id=u.id "
-            + _act_where + " ORDER BY a.created_at DESC LIMIT ?",
-            _act_params + [_act_lim]
-        ).fetchall()
-        if not _act_rows:
-            st.info("Brak rekord\u00f3w.")
-        else:
-            _act_data = []
-            for _ar in _act_rows:
-                _act_data.append({
-                    "Czas (UTC)":   (_ar["created_at"] or "")[:16].replace("T", " "),
-                    "U\u017cytkownik": _ar["username"] or "?",
-                    "Modu\u0142":   _ar["module"] or "",
-                    "Akcja":        _ar["action"] or "",
-                    "IP":           _ar["ip_address"] or "",
-                    "Metadane":     str(_ar["metadata_json"] or "")[:80],
-                })
-            _act_df = pd.DataFrame(_act_data)
-            st.dataframe(_act_df, use_container_width=True, hide_index=True)
-            # Eksport do Excela
-            if st.button("\U0001f4be Eksportuj log do Excela", key="adm_act_export"):
-                _act_buf = io.BytesIO()
-                with pd.ExcelWriter(_act_buf, engine="xlsxwriter") as _act_wr:
-                    _act_df.to_excel(_act_wr, sheet_name="Aktywnosc", index=False)
-                st.download_button(
-                    "\u2b07\ufe0f Pobierz log_aktywnosci.xlsx",
-                    data=_act_buf.getvalue(),
-                    file_name="log_aktywnosci.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-        # Podsumowanie: top uzytkownicy
-        st.markdown("---")
-        st.markdown("**Top u\u017cytkownicy wg liczby analiz**")
-        _top_rows = get_db().execute(
-            "SELECT u.username, COUNT(a.id) as cnt"
-            " FROM activity_log a JOIN users u ON a.user_id=u.id"
-            " WHERE a.module != 'system'"
-            " GROUP BY u.id ORDER BY cnt DESC LIMIT 10"
-        ).fetchall()
-        if _top_rows:
-            _top_df = pd.DataFrame([{"U\u017cytkownik": r["username"],
-                                      "Liczba analiz": r["cnt"]} for r in _top_rows])
-            st.bar_chart(_top_df.set_index("U\u017cytkownik"))
-
-    # ============================================================
-    # TAB 6 -- STATYSTYKI
-    # ============================================================
-    with _adm_tab_stats:
-        st.markdown("### \U0001f4ca Statystyki u\u017cytkowania")
-        _st_c1, _st_c2 = st.columns(2)
-        # Top modulow
-        _st_mod_rows = get_db().execute(
-            "SELECT module, COUNT(*) as cnt FROM activity_log"
-            " WHERE module != 'system' GROUP BY module ORDER BY cnt DESC LIMIT 10"
-        ).fetchall()
-        if _st_mod_rows:
-            with _st_c1:
-                st.markdown("**Top modu\u0142\u00f3w**")
-                _st_mod_df = pd.DataFrame([{"Modu\u0142": r["module"],
-                                             "Analizy": r["cnt"]} for r in _st_mod_rows])
-                st.bar_chart(_st_mod_df.set_index("Modu\u0142"))
-        # Analizy per dzien (30 dni)
-        _st_day_rows = get_db().execute(
-            "SELECT substr(created_at,1,10) as day, COUNT(*) as cnt"
-            " FROM activity_log WHERE module != 'system'"
-            " AND created_at >= date('now','-30 days')"
-            " GROUP BY day ORDER BY day"
-        ).fetchall()
-        if _st_day_rows:
-            with _st_c2:
-                st.markdown("**Analizy / dzie\u0144 (ostatnie 30 dni)**")
-                _st_day_df = pd.DataFrame([{"Dzie\u0144": r["day"],
-                                             "Analizy": r["cnt"]} for r in _st_day_rows])
-                st.bar_chart(_st_day_df.set_index("Dzie\u0144"))
-        # Logowania per kraj
-        _st_geo_rows = get_db().execute(
-            "SELECT geo_country, COUNT(*) as cnt FROM sessions"
-            " WHERE login_success=1 AND geo_country IS NOT NULL"
-            " GROUP BY geo_country ORDER BY cnt DESC"
-        ).fetchall()
-        if _st_geo_rows:
-            st.markdown("**Logowania wg kraju**")
-            _st_geo_df = pd.DataFrame([{"Kraj": r["geo_country"],
-                                         "Logowania": r["cnt"]} for r in _st_geo_rows])
-            try:
-                _st_fig = px.bar(_st_geo_df, x="Kraj", y="Logowania",
-                                 title="Logowania wg kraju")
-                st.plotly_chart(_st_fig, use_container_width=True)
-            except Exception:
-                st.dataframe(_st_geo_df, use_container_width=True, hide_index=True)
-
-    # ============================================================
-    # TAB 7 -- USTAWIENIA
-    # ============================================================
-    with _adm_tab_cfg:
-        st.markdown("### \u2699\ufe0f Ustawienia systemowe")
-        _cfg_rows = get_db().execute("SELECT key,value FROM settings ORDER BY key").fetchall()
-        _cfg_labels = {
-            "idle_timeout_minutes": "Timeout bezczynno\u015bci (minuty)",
-            "lockout_minutes":      "Czas blokady konta po b\u0142\u0119dach (minuty)",
-            "max_fail_attempts":    "Max pr\u00f3b logowania przed blokad\u0105",
-            "min_pw_length":        "Minimalna d\u0142ugo\u015b\u0107 has\u0142a (znaki)",
-            "rate_limit_window":    "Okno rate-limit (minuty)",
-        }
-        _cfg_form_vals = {r["key"]: r["value"] for r in _cfg_rows}
-        with st.form("adm_settings_form"):
-            _cfg_inputs = {}
-            for _ck, _cv in _cfg_form_vals.items():
-                _cfg_inputs[_ck] = st.number_input(
-                    _cfg_labels.get(_ck, _ck),
-                    value=int(_cv),
-                    min_value=1,
-                    key="adm_cfg_" + _ck,
-                )
-            _cfg_sub = st.form_submit_button(
-                "\U0001f4be Zapisz ustawienia", type="primary")
-        if _cfg_sub:
-            for _ck, _cv in _cfg_inputs.items():
-                _set_setting(_ck, str(int(_cv)))
-            st.success("\u2705 Ustawienia zapisane.")
-        st.markdown("---")
-        st.markdown("**Audit log (ostatnie 50 zdarze\u0144)**")
-        _aud_rows = get_db().execute(
-            "SELECT a.created_at,a.event_type,a.details_json,"
-            "ua.username as actor,ut.username as target"
-            " FROM audit_log a"
-            " LEFT JOIN users ua ON a.actor_user_id=ua.id"
-            " LEFT JOIN users ut ON a.target_user_id=ut.id"
-            " ORDER BY a.created_at DESC LIMIT 50"
-        ).fetchall()
-        if _aud_rows:
-            _aud_data = []
-            for _ar in _aud_rows:
-                _aud_data.append({
-                    "Czas":      (_ar["created_at"] or "")[:16].replace("T", " "),
-                    "Zdarzenie": _ar["event_type"] or "",
-                    "Aktor":     _ar["actor"] or "system",
-                    "Cel":       _ar["target"] or "",
-                    "Szczeg\u00f3\u0142y": str(_ar["details_json"] or "")[:100],
-                })
-            st.dataframe(pd.DataFrame(_aud_data), use_container_width=True,
-                         hide_index=True)
-
 else:
     st.info("\U0001f448 Wybierz modu\u0142 z menu bocznego.")
-
