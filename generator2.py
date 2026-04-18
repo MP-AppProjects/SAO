@@ -25,8 +25,454 @@ import statsmodels.api as sm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from factor_analyzer import FactorAnalyzer
 from factor_analyzer.factor_analyzer import calculate_kmo, calculate_bartlett_sphericity
+import sqlite3
+import hashlib
+import secrets
+import uuid
+import os
+import ipaddress
+import urllib.request
+import urllib.error
+import time
 
 st.set_page_config(page_title="System Analiz Openfield (SAO)", layout="wide", page_icon="\U0001f4ca")
+
+# =============================================================
+# PANEL ADMINISTRACYJNY -- baza danych i funkcje auth
+# =============================================================
+_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "sao_admin.db")
+
+_MODULE_KEYS = {
+    "dashboard":    "\U0001f3e0 Dashboard",
+    "project":      "\U0001f4c1 Projekt i S\u0142ownik",
+    "prep":         "\U0001f6e0\ufe0f Przygotowanie Danych",
+    "analyses":     "\U0001f4c8 Analizy i Tabele",
+    "regression":   "\U0001f4c9 Regresja",
+    "anova":        "\U0001f4ca ANOVA",
+    "normality":    "\U0001f4d0 Testy Normalno\u015bci",
+    "factor":       "\U0001f52c Analiza Czynnikowa",
+    "cluster":      "\U0001f3af Skupienia i Segmentacja",
+    "conjoint":     "\U0001f4ca Conjoint",
+    "maxdiff":      "\U0001f522 MaxDiff",
+    "wordcloud":    "\u2601\ufe0f Chmura S\u0142\u00f3w",
+    "export_excel": "\U0001f4be Eksport do Excela",
+    "export_pptx":  "\U0001f4ca Eksport do PowerPoint",
+    "admin":        "\U0001f512 Panel admina",
+}
+
+_LABEL_TO_KEY = {v: k for k, v in _MODULE_KEYS.items()}
+
+_DEFAULT_SETTINGS = {
+    "idle_timeout_minutes": "60",
+    "min_pw_length":        "10",
+    "max_fail_attempts":    "5",
+    "lockout_minutes":      "30",
+    "rate_limit_window":    "15",
+}
+
+
+def _init_db_schema(conn):
+    cur = conn.cursor()
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            password_salt TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            created_at TEXT NOT NULL,
+            created_by INTEGER,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            expires_at TEXT,
+            must_change_password INTEGER NOT NULL DEFAULT 0,
+            failed_login_count INTEGER NOT NULL DEFAULT 0,
+            locked_until TEXT,
+            last_login_at TEXT,
+            email TEXT,
+            full_name TEXT
+        );
+        CREATE TABLE IF NOT EXISTS module_permissions (
+            user_id INTEGER NOT NULL,
+            module_key TEXT NOT NULL,
+            granted INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, module_key)
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            session_token TEXT UNIQUE,
+            ip_address TEXT,
+            user_agent TEXT,
+            geo_country TEXT,
+            geo_city TEXT,
+            started_at TEXT NOT NULL,
+            last_seen_at TEXT,
+            ended_at TEXT,
+            login_success INTEGER NOT NULL DEFAULT 0,
+            logout_reason TEXT,
+            attempted_username TEXT
+        );
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            session_id INTEGER,
+            module TEXT,
+            action TEXT,
+            metadata_json TEXT,
+            created_at TEXT NOT NULL,
+            ip_address TEXT
+        );
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_user_id INTEGER,
+            target_user_id INTEGER,
+            event_type TEXT NOT NULL,
+            details_json TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS geo_cache (
+            ip_address TEXT PRIMARY KEY,
+            country TEXT,
+            city TEXT,
+            fetched_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        CREATE INDEX IF NOT EXISTS ix_activity_user      ON activity_log(user_id, created_at);
+        CREATE INDEX IF NOT EXISTS ix_activity_module    ON activity_log(module, created_at);
+        CREATE INDEX IF NOT EXISTS ix_sessions_user      ON sessions(user_id, started_at);
+        CREATE INDEX IF NOT EXISTS ix_sessions_active    ON sessions(ended_at);
+        CREATE INDEX IF NOT EXISTS ix_audit_target       ON audit_log(target_user_id, created_at);
+    """)
+    for k, v in _DEFAULT_SETTINGS.items():
+        cur.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v))
+    conn.commit()
+
+
+def _hash_password(pw, salt=None):
+    if salt is None:
+        salt = secrets.token_bytes(16)
+    elif isinstance(salt, str):
+        salt = bytes.fromhex(salt)
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 260000)
+    return h.hex(), salt.hex()
+
+
+def _verify_password(pw, stored_hash, stored_salt):
+    if not stored_hash or not stored_salt:
+        return False
+    h, _ = _hash_password(pw, stored_salt)
+    return secrets.compare_digest(h, stored_hash)
+
+
+def _now_iso():
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat()
+
+
+def _ensure_default_admin(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users")
+    if cur.fetchone()[0] == 0:
+        pw_hash, pw_salt = _hash_password("admin")
+        cur.execute(
+            """INSERT INTO users(username, password_hash, password_salt, role,
+                                 created_at, is_active, must_change_password)
+               VALUES (?, ?, ?, 'admin', ?, 1, 1)""",
+            ("admin", pw_hash, pw_salt, _now_iso()),
+        )
+        admin_id = cur.lastrowid
+        for mkey in _MODULE_KEYS.keys():
+            cur.execute(
+                "INSERT OR IGNORE INTO module_permissions(user_id, module_key, granted) VALUES (?, ?, 1)",
+                (admin_id, mkey),
+            )
+        cur.execute(
+            "INSERT INTO audit_log(actor_user_id, target_user_id, event_type, details_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            (admin_id, admin_id, "bootstrap_admin", json.dumps({"note": "domyslne konto admin/admin"}), _now_iso()),
+        )
+        conn.commit()
+
+
+@st.cache_resource
+def get_db():
+    os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(_DB_PATH, check_same_thread=False, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    _init_db_schema(conn)
+    _ensure_default_admin(conn)
+    return conn
+
+
+def _get_setting(key, default=None):
+    try:
+        row = get_db().execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+    except Exception:
+        return default
+
+
+def _set_setting(key, value):
+    get_db().execute(
+        "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, str(value)),
+    )
+
+
+def _get_setting_int(key, default):
+    try:
+        return int(_get_setting(key, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_client_ip():
+    try:
+        hdrs = st.context.headers
+        xff = (hdrs.get("X-Forwarded-For") or "").split(",")[0].strip()
+        if xff:
+            return xff
+        xri = hdrs.get("X-Real-IP")
+        if xri:
+            return xri.strip()
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
+def _get_user_agent():
+    try:
+        return (st.context.headers.get("User-Agent") or "")[:500]
+    except Exception:
+        return ""
+
+
+def _is_private_ip(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+        return a.is_private or a.is_loopback or a.is_link_local or a.is_reserved
+    except ValueError:
+        return True
+
+
+def _geo_lookup(ip):
+    """Zwraca (country, city). Uzywa cache w DB. Dla prywatnych IP zwraca ("LAN", "sie\u0107 lokalna")."""
+    if not ip:
+        return (None, None)
+    if _is_private_ip(ip):
+        return ("LAN", "sie\u0107 lokalna")
+    conn = get_db()
+    row = conn.execute("SELECT country, city FROM geo_cache WHERE ip_address=?", (ip,)).fetchone()
+    if row:
+        return (row["country"], row["city"])
+    country, city = (None, None)
+    try:
+        req = urllib.request.Request(
+            "https://ipapi.co/" + ip + "/json/",
+            headers={"User-Agent": "SAO/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            country = payload.get("country_name") or payload.get("country")
+            city    = payload.get("city")
+    except Exception:
+        country, city = (None, None)
+    conn.execute(
+        "INSERT OR REPLACE INTO geo_cache(ip_address, country, city, fetched_at) VALUES(?, ?, ?, ?)",
+        (ip, country, city, _now_iso()),
+    )
+    return (country, city)
+
+
+def _get_user_by_name(username):
+    return get_db().execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+
+
+def _get_user_by_id(user_id):
+    return get_db().execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+
+
+def _load_user_perms(user_id, role):
+    if role == "admin":
+        return {k: True for k in _MODULE_KEYS.keys()}
+    rows = get_db().execute(
+        "SELECT module_key, granted FROM module_permissions WHERE user_id=?", (user_id,)
+    ).fetchall()
+    perms = {k: False for k in _MODULE_KEYS.keys()}
+    for r in rows:
+        perms[r["module_key"]] = bool(r["granted"])
+    perms["admin"] = False
+    return perms
+
+
+def _set_module_perm(user_id, module_key, granted, actor_id=None):
+    get_db().execute(
+        """INSERT INTO module_permissions(user_id, module_key, granted) VALUES(?, ?, ?)
+           ON CONFLICT(user_id, module_key) DO UPDATE SET granted=excluded.granted""",
+        (user_id, module_key, int(bool(granted))),
+    )
+    get_db().execute(
+        "INSERT INTO audit_log(actor_user_id, target_user_id, event_type, details_json, created_at) VALUES(?, ?, ?, ?, ?)",
+        (actor_id, user_id, "set_perm",
+         json.dumps({"module": module_key, "granted": bool(granted)}), _now_iso()),
+    )
+
+
+def _validate_password_policy(pw, username=""):
+    min_len = _get_setting_int("min_pw_length", 10)
+    if len(pw) < min_len:
+        return "Has\u0142o musi mie\u0107 co najmniej " + str(min_len) + " znak\u00f3w."
+    if not any(c.isdigit() for c in pw):
+        return "Has\u0142o musi zawiera\u0107 co najmniej jedn\u0105 cyfr\u0119."
+    if not any(c.isalpha() for c in pw):
+        return "Has\u0142o musi zawiera\u0107 co najmniej jedn\u0105 liter\u0119."
+    if username and username.lower() in pw.lower():
+        return "Has\u0142o nie mo\u017ce zawiera\u0107 nazwy u\u017cytkownika."
+    return None
+
+
+def _create_session(user_id, ip, user_agent, success=True, attempted_username=None, reason=None):
+    token = uuid.uuid4().hex
+    country, city = _geo_lookup(ip) if success else (None, None)
+    now = _now_iso()
+    cur = get_db().execute(
+        """INSERT INTO sessions(user_id, session_token, ip_address, user_agent,
+                                geo_country, geo_city, started_at, last_seen_at,
+                                login_success, logout_reason, attempted_username)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (user_id, token if success else None, ip, user_agent,
+         country, city, now, now if success else None,
+         1 if success else 0, reason, attempted_username),
+    )
+    return cur.lastrowid, token, country, city
+
+
+def _validate_session(token):
+    if not token:
+        return None
+    row = get_db().execute(
+        "SELECT * FROM sessions WHERE session_token=? AND ended_at IS NULL",
+        (token,),
+    ).fetchone()
+    return row
+
+
+def _end_session(session_id, reason="logout"):
+    get_db().execute(
+        "UPDATE sessions SET ended_at=?, logout_reason=?, session_token=NULL WHERE id=? AND ended_at IS NULL",
+        (_now_iso(), reason, session_id),
+    )
+
+
+def _touch_session(session_id):
+    get_db().execute("UPDATE sessions SET last_seen_at=? WHERE id=?", (_now_iso(), session_id))
+
+
+def _log_activity(module, action, metadata=None):
+    try:
+        uid = st.session_state.get("current_user_id")
+        sid = st.session_state.get("session_db_id")
+        ip  = st.session_state.get("current_user_ip") or _get_client_ip()
+        meta_json = None
+        if metadata is not None:
+            try:
+                meta_json = json.dumps(metadata, ensure_ascii=True, default=str)[:2000]
+            except Exception:
+                meta_json = None
+        get_db().execute(
+            """INSERT INTO activity_log(user_id, session_id, module, action, metadata_json, created_at, ip_address)
+               VALUES(?, ?, ?, ?, ?, ?, ?)""",
+            (uid, sid, module, action, meta_json, _now_iso(), ip),
+        )
+    except Exception:
+        pass
+
+
+def _tracked_button(label, module_key, action, **kwargs):
+    """Owijka na st.button ktora loguje klikniecie do activity_log."""
+    clicked = st.button(label, **kwargs)
+    if clicked:
+        _log_activity(module_key, action)
+    return clicked
+
+
+def _user_can_access(module_key):
+    if not st.session_state.get("authenticated"):
+        return False
+    if st.session_state.get("current_user_role") == "admin":
+        return True
+    perms = st.session_state.get("current_user_perms") or {}
+    return bool(perms.get(module_key, False))
+
+
+def _require_module_access(module_key):
+    if not _user_can_access(module_key):
+        st.error("\U0001f512 Brak uprawnie\u0144 do tego modu\u0142u. Skontaktuj si\u0119 z administratorem.")
+        st.stop()
+
+
+def _is_locked(user_row):
+    lu = user_row["locked_until"] if user_row else None
+    if not lu:
+        return False
+    try:
+        return datetime.datetime.fromisoformat(lu) > datetime.datetime.utcnow()
+    except Exception:
+        return False
+
+
+def _bump_failed_login(user_id):
+    max_fail = _get_setting_int("max_fail_attempts", 5)
+    lock_min = _get_setting_int("lockout_minutes", 30)
+    conn = get_db()
+    row = conn.execute("SELECT failed_login_count FROM users WHERE id=?", (user_id,)).fetchone()
+    new_count = (row["failed_login_count"] if row else 0) + 1
+    locked_until = None
+    if new_count >= max_fail:
+        locked_until = (datetime.datetime.utcnow() + datetime.timedelta(minutes=lock_min)).replace(microsecond=0).isoformat()
+    conn.execute(
+        "UPDATE users SET failed_login_count=?, locked_until=? WHERE id=?",
+        (new_count, locked_until, user_id),
+    )
+    return new_count, locked_until
+
+
+def _reset_failed_login(user_id):
+    get_db().execute(
+        "UPDATE users SET failed_login_count=0, locked_until=NULL, last_login_at=? WHERE id=?",
+        (_now_iso(), user_id),
+    )
+
+
+def _attempt_login(username, password, ip, user_agent):
+    """Zwraca (status, payload). status: 'ok'|'bad_credentials'|'locked'|'inactive'|'expired'."""
+    user = _get_user_by_name(username)
+    if not user:
+        _create_session(None, ip, user_agent, success=False,
+                        attempted_username=username, reason="unknown_user")
+        return ("bad_credentials", None)
+    if _is_locked(user):
+        return ("locked", user["locked_until"])
+    if not user["is_active"]:
+        return ("inactive", None)
+    if user["expires_at"]:
+        try:
+            if datetime.datetime.fromisoformat(user["expires_at"]) < datetime.datetime.utcnow():
+                return ("expired", user["expires_at"])
+        except Exception:
+            pass
+    if not _verify_password(password, user["password_hash"], user["password_salt"]):
+        _bump_failed_login(user["id"])
+        _create_session(user["id"], ip, user_agent, success=False,
+                        attempted_username=username, reason="bad_password")
+        return ("bad_credentials", None)
+    _reset_failed_login(user["id"])
+    session_id, token, country, city = _create_session(user["id"], ip, user_agent, success=True)
+    return ("ok", {"user": user, "session_id": session_id, "token": token,
+                   "country": country, "city": city})
 
 # =============================================================
 # LOGOWANIE
@@ -89,6 +535,124 @@ st.markdown("""
 
 </style>
 """, unsafe_allow_html=True)
+
+# =============================================================
+# GATE LOGOWANIA
+# =============================================================
+
+# Idle timeout: jesli uzytkownik zalogowany ale nieaktywny -- wyloguj
+if st.session_state.get('authenticated'):
+    _lg_idle_timeout = _get_setting_int("idle_timeout_minutes", 60)
+    _lg_last_ts = st.session_state.get('last_activity_ts', time.time())
+    if time.time() - _lg_last_ts > _lg_idle_timeout * 60:
+        _lg_dead_sid = st.session_state.get('session_db_id')
+        if _lg_dead_sid:
+            _end_session(_lg_dead_sid, "idle_timeout")
+        st.session_state.clear()
+        st.warning("\u23f0 Sesja wygas\u0142a z powodu bezczynno\u015bci. Zaloguj si\u0119 ponownie.")
+    else:
+        st.session_state.last_activity_ts = time.time()
+        _lg_live_sid = st.session_state.get('session_db_id')
+        if _lg_live_sid:
+            _touch_session(_lg_live_sid)
+
+# Gate: blokuj nieuprawniony dostep
+if not st.session_state.get('authenticated'):
+    _lg_ip = _get_client_ip()
+    _lg_ua = _get_user_agent()
+    _lgc1, _lgc2, _lgc3 = st.columns([1, 2, 1])
+    with _lgc2:
+        st.markdown("""
+<div style="text-align:center; padding:30px 0 10px 0;">
+  <span style="font-size:2.5rem;">\U0001f4ca</span><br>
+  <span style="font-size:1.4rem; font-weight:bold; color:#1F4E79;">System Analiz Openfield (SAO)</span><br>
+  <span style="color:#666; font-size:0.9rem;">Zaloguj si\u0119, aby kontynuowa\u0107</span>
+</div>""", unsafe_allow_html=True)
+        with st.form("lg_login_form"):
+            _lg_user_in = st.text_input("\U0001f464 Nazwa u\u017cytkownika", placeholder="login")
+            _lg_pass_in = st.text_input("\U0001f511 Has\u0142o", type="password", placeholder="has\u0142o")
+            _lg_btn = st.form_submit_button("\u25b6\ufe0f Zaloguj", type="primary",
+                                            use_container_width=True)
+        if _lg_btn:
+            if not _lg_user_in or not _lg_pass_in:
+                st.error("Podaj nazw\u0119 u\u017cytkownika i has\u0142o.")
+            else:
+                _lg_status, _lg_pl = _attempt_login(
+                    _lg_user_in.strip(), _lg_pass_in, _lg_ip, _lg_ua)
+                if _lg_status == "ok":
+                    _lg_u = _lg_pl["user"]
+                    st.session_state.authenticated         = True
+                    st.session_state.current_user_id       = _lg_u["id"]
+                    st.session_state.current_user_name     = _lg_u["username"]
+                    st.session_state.current_user_role     = _lg_u["role"]
+                    st.session_state.current_user_perms    = _load_user_perms(
+                        _lg_u["id"], _lg_u["role"])
+                    st.session_state.session_token         = _lg_pl["token"]
+                    st.session_state.session_db_id         = _lg_pl["session_id"]
+                    st.session_state.last_activity_ts      = time.time()
+                    st.session_state.must_change_password  = bool(_lg_u["must_change_password"])
+                    st.session_state.current_user_ip       = _lg_ip
+                    _log_activity("system", "login",
+                                  {"ip": _lg_ip, "country": _lg_pl.get("country")})
+                    st.rerun()
+                elif _lg_status == "locked":
+                    _lk_until = str(_lg_pl or "")[:16].replace("T", " ")
+                    st.error("\U0001f512 Konto zablokowane. Spr\u00f3buj ponownie po: "
+                             + _lk_until + " UTC")
+                elif _lg_status == "inactive":
+                    st.error("\u26d4 To konto jest nieaktywne. Skontaktuj si\u0119 z administratorem.")
+                elif _lg_status == "expired":
+                    _exp_dt = str(_lg_pl or "")[:10]
+                    st.error("\u23f3 Dost\u0119p wygas\u0142 (" + _exp_dt
+                             + "). Skontaktuj si\u0119 z administratorem.")
+                else:
+                    st.error("\u274c Nieprawid\u0142owa nazwa u\u017cytkownika lub has\u0142o.")
+    st.stop()
+
+# Zmiana hasla przy pierwszym logowaniu (must_change_password)
+if st.session_state.get('must_change_password'):
+    _lgc1, _lgc2, _lgc3 = st.columns([1, 2, 1])
+    with _lgc2:
+        st.warning("\U0001f511 Przed kontynuowaniem musisz ustawi\u0107 nowe has\u0142o.")
+        _cpw_uname = st.session_state.get("current_user_name", "")
+        _cpw_min = str(_get_setting_int("min_pw_length", 10))
+        with st.form("lg_change_pw_form"):
+            _cpw_old  = st.text_input("Aktualne has\u0142o", type="password")
+            _cpw_new1 = st.text_input("Nowe has\u0142o", type="password",
+                                      help="Min. " + _cpw_min + " znak\u00f3w, cyfra i litera")
+            _cpw_new2 = st.text_input("Powt\u00f3rz nowe has\u0142o", type="password")
+            _cpw_btn  = st.form_submit_button("\u2705 Zmie\u0144 has\u0142o", type="primary",
+                                              use_container_width=True)
+        if _cpw_btn:
+            _cpw_user = _get_user_by_name(_cpw_uname)
+            if not _cpw_user:
+                st.error("B\u0142\u0105d: nie znaleziono u\u017cytkownika.")
+            elif not _verify_password(_cpw_old, _cpw_user["password_hash"],
+                                      _cpw_user["password_salt"]):
+                st.error("\u274c Nieprawid\u0142owe aktualne has\u0142o.")
+            elif _cpw_new1 != _cpw_new2:
+                st.error("\u274c Nowe has\u0142a nie s\u0105 identyczne.")
+            else:
+                _cpw_err = _validate_password_policy(_cpw_new1, _cpw_uname)
+                if _cpw_err:
+                    st.error("\u274c " + _cpw_err)
+                else:
+                    _cpw_h, _cpw_s = _hash_password(_cpw_new1)
+                    get_db().execute(
+                        "UPDATE users SET password_hash=?, password_salt=?,"
+                        " must_change_password=0 WHERE id=?",
+                        (_cpw_h, _cpw_s, _cpw_user["id"]))
+                    get_db().execute(
+                        "INSERT INTO audit_log(actor_user_id, target_user_id,"
+                        " event_type, details_json, created_at) VALUES(?,?,?,?,?)",
+                        (_cpw_user["id"], _cpw_user["id"], "change_password",
+                         json.dumps({"reason": "first_login"}), _now_iso()))
+                    st.session_state.must_change_password = False
+                    _log_activity("system", "change_password",
+                                  {"reason": "first_login"})
+                    st.success("\u2705 Has\u0142o zmienione. Mo\u017cesz teraz u\u017cywa\u0107 aplikacji.")
+                    st.rerun()
+    st.stop()
 
 # -------------------------------------------------------------
 # FUNKCJE POMOCNICZE
@@ -649,6 +1213,41 @@ def module_header(icon, title, subtitle=""):
   {sub_html}
 </div>
 """, unsafe_allow_html=True)
+
+    # Show active split indicator below the header
+    _sv = st.session_state.get('split_var')
+    if _sv:
+        st.markdown(
+            f'<div style="background:#FFF4CE;border-left:4px solid #D97706;'
+            f'padding:10px 16px;margin-bottom:15px;border-radius:4px;">'
+            f'<strong>\U0001f500 Aktywny podzia\u0142 na podzbiory:</strong> '
+            f'<code>{_sv}</code> \u2014 wyniki b\u0119d\u0105 liczone osobno dla ka\u017cdej grupy. '
+            f'<small>(zmie\u0144 w <em>Przygotowanie Danych \u2192 Podzia\u0142 na podzbiory</em>)</small>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+    # Show active weights indicator below the header
+    _w = st.session_state.get('weights')
+    if _w is not None:
+        try:
+            _n_w = len(_w)
+            _mn  = float(np.min(_w))
+            _mx  = float(np.max(_w))
+            _targets = st.session_state.get('weight_targets', {}) or {}
+            _vars = ", ".join(f"<code>{v}</code>" for v in _targets.keys()) if _targets else "<em>custom</em>"
+        except Exception:
+            _n_w = "?"; _mn = 0; _mx = 0; _vars = ""
+        st.markdown(
+            f'<div style="background:#E2F0D9;border-left:4px solid #548235;'
+            f'padding:10px 16px;margin-bottom:15px;border-radius:4px;">'
+            f'<strong>\u2696\ufe0f Aktywne wagi:</strong> '
+            f'N = {_n_w:,} \u00b7 min = {_mn:.3f} \u00b7 max = {_mx:.3f} \u00b7 '
+            f'zmienne: {_vars} '
+            f'<small>(zarz\u0105dzaj w <em>Przygotowanie Danych \u2192 Wa\u017cenie</em>)</small>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
 
 
 def _format_means_table(df):
@@ -1390,6 +1989,12 @@ def export_tables_to_sheet(writer, s_name, results_dict, var_labels, add_charts=
         title_row_map[title] = sr   # record where this table starts
         df_export = df_res.copy()
 
+        # Split off group label (format: "base_title | group_label")
+        _grp_suffix = ""
+        _base_title = title
+        if " | " in title and "=" in title.split(" | ", 1)[-1]:
+            _base_title, _grp_suffix = title.rsplit(" | ", 1)
+
         # Convert percentage columns to float for proper formatting
         if s_name != 'Korelacje':
             for col in df_export.columns:
@@ -1401,18 +2006,23 @@ def export_tables_to_sheet(writer, s_name, results_dict, var_labels, add_charts=
 
         # Build display title
         if s_name == 'Cz\u0119sto\u015bci':
-            display_title = f"[{title}] {var_labels.get(title, title)}"
-            chart_title   = var_labels.get(title, title)   # label only (no [code])
+            display_title = f"[{_base_title}] {var_labels.get(_base_title, _base_title)}"
+            chart_title   = var_labels.get(_base_title, _base_title)
         elif s_name in ['Krzy\u017cowe', '\u015arednie']:
-            if ' x ' in title:
-                r_v, c_v = title.split(' x ', 1)
+            if ' x ' in _base_title:
+                r_v, c_v = _base_title.split(' x ', 1)
                 display_title = f"Wiersz: [{r_v}] {var_labels.get(r_v, r_v)}  \u00d7  Kolumna: [{c_v}] {var_labels.get(c_v, c_v)}"
             else:
-                display_title = title
+                display_title = _base_title
             chart_title = display_title
         else:
-            display_title = title
-            chart_title   = title
+            display_title = _base_title
+            chart_title   = _base_title
+
+        # Append group label to titles if present
+        if _grp_suffix:
+            display_title = f"{display_title}  \u2014  \U0001f500 {_grp_suffix}"
+            chart_title   = f"{chart_title} \u2014 {_grp_suffix}"
 
         # Title row
         if num_cols > 1:
@@ -1593,7 +2203,8 @@ def export_regression_to_excel(writer, regression_results, var_labels):
             row += 2
             continue
         dep_label = var_labels.get(res['dep_var'], res['dep_var'])
-        worksheet.merge_range(row, 0, row, 8, f"REGRESJA OLS -- Zmienna zale\u017cna: [{res['dep_var']}] {dep_label}  |  Blok {res['Blok']}", fmt_title)
+        _grp_s = f"  \u2014  \U0001f500 {res['group_label']}" if res.get('group_label') else ""
+        worksheet.merge_range(row, 0, row, 8, f"REGRESJA OLS -- Zmienna zale\u017cna: [{res['dep_var']}] {dep_label}  |  Blok {res['Blok']}{_grp_s}", fmt_title)
         row += 1
         worksheet.write(row, 0, "Podsumowanie Modelu", fmt_section)
         row += 1
@@ -1665,7 +2276,8 @@ def export_anova_to_excel(writer, anova_results, var_labels):
     for res in anova_results:
         dep_l = var_labels.get(res['dep_var'], res['dep_var'])
         grp_l = var_labels.get(res['group_var'], res['group_var'])
-        worksheet.merge_range(row, 0, row, 6, f"ANOVA -- Zmienna zale\u017cna: {dep_l}  |  Czynnik: {grp_l}", fmt_title)
+        _grp_s = f"  \u2014  \U0001f500 {res['group_label']}" if res.get('group_label') else ""
+        worksheet.merge_range(row, 0, row, 6, f"ANOVA -- Zmienna zale\u017cna: {dep_l}  |  Czynnik: {grp_l}{_grp_s}", fmt_title)
         row += 2
         worksheet.write(row, 0, "Tabela ANOVA", fmt_section)
         row += 1
@@ -1725,7 +2337,8 @@ def export_factor_to_excel(writer, factor_results, var_labels):
     for i in range(1, 12): worksheet.set_column(i, i, 14)
     row = 0
     for res in factor_results:
-        worksheet.merge_range(row, 0, row, res['loadings'].shape[1], f"ANALIZA CZYNNIKOWA -- Rotacja: {res['rotation'].upper()}  |  N={res['n']}", fmt_title)
+        _grp_s = f"  \u2014  \U0001f500 {res['group_label']}" if res.get('group_label') else ""
+        worksheet.merge_range(row, 0, row, res['loadings'].shape[1], f"ANALIZA CZYNNIKOWA -- Rotacja: {res['rotation'].upper()}  |  N={res['n']}{_grp_s}", fmt_title)
         row += 1
         # KMO and Bartlett
         worksheet.write(row, 0, "Adekwatno\u015b\u0107 pr\u00f3by KMO", fmt_label)
@@ -2087,7 +2700,8 @@ def export_conjoint_to_excel(writer, conjoint_results, var_labels, meta_vvl=None
     for res in conjoint_results:
         if res.get('error'):
             ws.write(row, 0, f"B\u0141\u0104D: {res['error']}", fmt_s); row += 2; continue
-        ws.merge_range(row, 0, row, 4, f"CONJOINT -- {res['method']}", fmt_t); row += 1
+        _grp_s = f"  \u2014  \U0001f500 {res['group_label']}" if res.get('group_label') else ""
+        ws.merge_range(row, 0, row, 4, f"CONJOINT -- {res['method']}{_grp_s}", fmt_t); row += 1
         # Model summary
         ws.write(row, 0, "N", fmt_lbl)
         ws.write(row, 1, res['n'], workbook.add_format({'border':1,'align':'right','num_format':'#,##0'}))
@@ -2198,6 +2812,16 @@ def export_maxdiff_to_excel(writer, maxdiff_results, var_labels):
 
 # SESSION STATE
 # -------------------------------------------------------------
+if 'authenticated'          not in st.session_state: st.session_state.authenticated = False
+if 'current_user_id'        not in st.session_state: st.session_state.current_user_id = None
+if 'current_user_name'      not in st.session_state: st.session_state.current_user_name = ""
+if 'current_user_role'      not in st.session_state: st.session_state.current_user_role = ""
+if 'current_user_perms'     not in st.session_state: st.session_state.current_user_perms = {}
+if 'session_token'          not in st.session_state: st.session_state.session_token = None
+if 'session_db_id'          not in st.session_state: st.session_state.session_db_id = None
+if 'last_activity_ts'       not in st.session_state: st.session_state.last_activity_ts = time.time()
+if 'must_change_password'   not in st.session_state: st.session_state.must_change_password = False
+if 'current_user_ip'        not in st.session_state: st.session_state.current_user_ip = ""
 if 'mrs_sets'            not in st.session_state: st.session_state.mrs_sets = {}
 if 'matrix_sets'         not in st.session_state: st.session_state.matrix_sets = {}
 if 'matrix_results'      not in st.session_state: st.session_state.matrix_results = []
@@ -2224,6 +2848,8 @@ if 'reg_blocks'          not in st.session_state: st.session_state.reg_blocks = 
 if 'conjoint_results'    not in st.session_state: st.session_state.conjoint_results = []
 if 'maxdiff_results'     not in st.session_state: st.session_state.maxdiff_results = []
 if 'normality_results'   not in st.session_state: st.session_state.normality_results = {}
+if 'wordcloud_results'   not in st.session_state: st.session_state.wordcloud_results = []
+if 'split_var'           not in st.session_state: st.session_state.split_var = None
 if 'maxdiff_pairs'       not in st.session_state: st.session_state.maxdiff_pairs = [('', '')]
 if 'data_source'         not in st.session_state: st.session_state.data_source = 'spss'
 if 'excel_col_types'     not in st.session_state: st.session_state.excel_col_types = {}
@@ -2238,6 +2864,65 @@ def _merge_result(results_list, new_entry, key_fn):
             results_list[i] = new_entry
             return
     results_list.append(new_entry)
+
+# -- Helper: split file iteration (SPSS-style) ------------------------
+def _iter_split_groups(df, df_raw, var_labels, split_var, weights=None):
+    """Yield (group_label, df_slice, df_raw_slice, weights_slice) for each
+    category of the split variable. If split_var is None/empty, yields
+    a single item with the full dataset and group_label=''.
+
+    group_label is used as a prefix/marker in result titles, e.g.:
+      '' (no split) or 'plec=Kobieta' (with split).
+    """
+    if not split_var or split_var not in df_raw.columns:
+        yield ('', df, df_raw, weights)
+        return
+    # Get unique values from df (which has labels applied)
+    series_labeled = df[split_var] if split_var in df.columns else df_raw[split_var]
+    # Drop NaN and get sorted unique categories
+    try:
+        unique_vals = sorted(series_labeled.dropna().unique(), key=lambda x: str(x))
+    except Exception:
+        unique_vals = list(series_labeled.dropna().unique())
+
+    split_lbl = var_labels.get(split_var, split_var)
+    for val in unique_vals:
+        mask = (series_labeled == val)
+        if mask.sum() == 0:
+            continue
+        df_slice     = df.loc[mask]
+        df_raw_slice = df_raw.loc[mask]
+        w_slice      = None
+        if weights is not None:
+            w_ser = pd.Series(weights, index=df_raw.index)
+            w_slice = w_ser.loc[mask].values
+        lbl = f"{split_lbl}={val}"
+        yield (lbl, df_slice, df_raw_slice, w_slice)
+
+def _split_badge(grp_label):
+    """Render colored badge info that a result comes from a split group.
+    Returns nothing if grp_label is empty."""
+    if not grp_label:
+        return
+    st.markdown(
+        f'<div style="display:inline-block;background:#FFF4CE;'
+        f'border-left:3px solid #D97706;padding:4px 10px;margin:4px 0 8px 0;'
+        f'border-radius:4px;font-size:0.88em;">'
+        f'<strong>\U0001f500 Podzia\u0142:</strong> <code>{grp_label}</code>'
+        f'</div>',
+        unsafe_allow_html=True
+    )
+
+def _extract_split_from_title(title_key):
+    """Extract (base_title, group_label) from a key like 'Q1 | plec=Kobieta'.
+    Returns (title_key, '') if no split present."""
+    if not isinstance(title_key, str):
+        return title_key, ''
+    if " | " in title_key:
+        _base, _grp = title_key.rsplit(" | ", 1)
+        if "=" in _grp:
+            return _base, _grp
+    return title_key, ''
 
 # -------------------------------------------------------------
 # ?? Source selection ??????????????????????????????????????????
@@ -2409,30 +3094,36 @@ else:
     use_weights = False
 
 st.sidebar.markdown("---")
+
+# Sidebar: info o zalogowanym uzytkowniku + wylogowanie
+_sw_name  = st.session_state.get("current_user_name", "")
+_sw_role  = st.session_state.get("current_user_role", "")
+_sw_label = "Administrator" if _sw_role == "admin" else "U\u017cytkownik"
+st.sidebar.markdown(
+    "<div style='background:#E8F0FB;border-radius:6px;padding:6px 10px;"
+    "margin-bottom:6px;font-size:0.82rem;'>"
+    "<b>\U0001f464 " + _sw_name + "</b><br>"
+    "<span style='color:#555;'>" + _sw_label + "</span></div>",
+    unsafe_allow_html=True)
+if st.sidebar.button("\u21a9\ufe0f Wyloguj", key="sidebar_logout",
+                     use_container_width=True):
+    _sw_sid = st.session_state.get('session_db_id')
+    if _sw_sid:
+        _end_session(_sw_sid, "logout")
+    _log_activity("system", "logout", {"username": _sw_name})
+    st.session_state.clear()
+    st.rerun()
+
 st.sidebar.markdown("## \U0001f4cc Nawigacja")
 
-_MENU_ITEMS = [
-    "\U0001f3e0 Dashboard",
-    "\U0001f4c1 Projekt i S\u0142ownik",
-    "\U0001f6e0\ufe0f Przygotowanie Danych",
-    "\U0001f4c8 Analizy i Tabele",
-    "\U0001f4c9 Regresja",
-    "\U0001f4ca ANOVA",
-    "\U0001f4d0 Testy Normalno\u015bci",
-    "\U0001f52c Analiza Czynnikowa",
-    "\U0001f3af Skupienia i Segmentacja",
-    "\U0001f4ca Conjoint",
-    "\U0001f522 MaxDiff",
-    "\u2601\ufe0f Chmura S\u0142\u00f3w",
-    "\U0001f4be Eksport do Excela",
-    "\U0001f4ca Eksport do PowerPoint",
-]
+# Menu filtrowane wg uprawnien uzytkownika
+_MENU_ITEMS = [lbl for key, lbl in _MODULE_KEYS.items() if _user_can_access(key)]
 
 # Allow tile clicks to navigate by writing to session state
 if 'nav_to' not in st.session_state:
     st.session_state.nav_to = None
-if 'current_menu' not in st.session_state:
-    st.session_state.current_menu = _MENU_ITEMS[0]
+if 'current_menu' not in st.session_state or st.session_state.current_menu not in _MENU_ITEMS:
+    st.session_state.current_menu = _MENU_ITEMS[0] if _MENU_ITEMS else ""
 
 # If a tile was clicked, update current_menu then clear nav_to
 if st.session_state.nav_to and st.session_state.nav_to in _MENU_ITEMS:
@@ -2449,6 +3140,7 @@ menu = st.sidebar.radio("", _MENU_ITEMS,
 # DASHBOARD
 # =============================================================
 if menu == "\U0001f3e0 Dashboard":
+    _require_module_access("dashboard")
     n_rows, n_cols_db = len(df_raw), len(df_raw.columns)
 
     st.markdown(f"""
@@ -2585,6 +3277,7 @@ if menu == "\U0001f3e0 Dashboard":
 # MODUL 1: PROJEKT I SLOWNIK
 # -------------------------------------------------------------
 elif menu == "\U0001f4c1 Projekt i S\u0142ownik":
+    _require_module_access("project")
     module_header("\U0001f4c1", "Projekt i S\u0142ownik")
     tab_proj, tab_summary, tab_dict = st.tabs(["\u2699\ufe0f Projekt", "\U0001f4cb Podsumowanie Bazy", "\U0001f4d6 S\u0142ownik Zmiennych"])
 
@@ -2759,6 +3452,7 @@ elif menu == "\U0001f4c1 Projekt i S\u0142ownik":
                                        if st.session_state.weights is not None else None,
                 "maxdiff_pairs":       st.session_state.maxdiff_pairs,
                 "reg_blocks":          st.session_state.reg_blocks,
+                "split_var":           st.session_state.split_var,
             }
             if include_results:
                 data["results"] = {
@@ -2904,6 +3598,7 @@ elif menu == "\U0001f4c1 Projekt i S\u0142ownik":
                         st.session_state.excel_col_types   = raw_data.get("excel_col_types", {})
                         st.session_state.maxdiff_pairs     = raw_data.get("maxdiff_pairs", [('', '')])
                         st.session_state.reg_blocks        = raw_data.get("reg_blocks", [[]])
+                        st.session_state.split_var         = raw_data.get("split_var", None)
                         w = raw_data.get("weights")
                         st.session_state.weights = np.array(w) if w else None
                         # Results
@@ -2996,19 +3691,22 @@ elif menu == "\U0001f4c1 Projekt i S\u0142ownik":
 # MODU? 2: PRZYGOTOWANIE DANYCH
 # -------------------------------------------------------------
 elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
+    _require_module_access("prep")
     module_header("\U0001f6e0\ufe0f", "Przygotowanie Danych")
     # For Excel: add an extra tab for type overrides
     if is_excel:
-        tab_miss, tab_labels, tab_types, tab_clean, tab_mrs, tab_matrix, tab_weight, tab_recode, tab_box = st.tabs([
+        tab_miss, tab_labels, tab_types, tab_clean, tab_mrs, tab_matrix, tab_weight, tab_recode, tab_box, tab_split = st.tabs([
             "\u26a0\ufe0f Braki", "\U0001f3f7\ufe0f Etykiety", "\U0001f522 Typy", "\U0001f9f9 Czyszczenie",
             "\U0001f5f9 Wielokrotne odp.", "\U0001f4cb Matrycowe",
-            "\u2696\ufe0f Wa\u017cenie", "\U0001f504 Rekodowanie", "\U0001f4e6 Grupowanie odpowiedzi"
+            "\u2696\ufe0f Wa\u017cenie", "\U0001f504 Rekodowanie", "\U0001f4e6 Grupowanie odpowiedzi",
+            "\U0001f500 Podzia\u0142 na podzbiory"
         ])
     else:
-        tab_miss, tab_labels, tab_clean, tab_mrs, tab_matrix, tab_weight, tab_recode, tab_box = st.tabs([
+        tab_miss, tab_labels, tab_clean, tab_mrs, tab_matrix, tab_weight, tab_recode, tab_box, tab_split = st.tabs([
             "\u26a0\ufe0f Braki", "\U0001f3f7\ufe0f Etykiety", "\U0001f9f9 Czyszczenie",
             "\U0001f5f9 Wielokrotne odp.", "\U0001f4cb Matrycowe",
-            "\u2696\ufe0f Wa\u017cenie", "\U0001f504 Rekodowanie", "\U0001f4e6 Grupowanie odpowiedzi"
+            "\u2696\ufe0f Wa\u017cenie", "\U0001f504 Rekodowanie", "\U0001f4e6 Grupowanie odpowiedzi",
+            "\U0001f500 Podzia\u0142 na podzbiory"
         ])
         tab_types = None
 
@@ -3154,7 +3852,7 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
             else:
                 st.info("Brak warto\u015bci do rekodowania (zmienna pusta lub brak danych).")
 
-        if unique_vals and st.button("\u2705 Utw\u00f3rz rekodowan\u0105 zmienn\u0105", type="primary", use_container_width=True):
+        if unique_vals and _tracked_button("\u2705 Utw\u00f3rz rekodowan\u0105 zmienn\u0105", "prep", "create_recoding", type="primary", use_container_width=True):
             if not new_var_name.strip():
                 st.error("Podaj nazw\u0119 nowej zmiennej.")
             elif new_var_name.strip() in df_raw.columns:
@@ -3955,6 +4653,52 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
     with tab_weight:
         st.markdown("#### Wa\u017cenie RIM (iteracyjne dopasowanie proporcjonalne)")
 
+        with st.expander("\U0001f4d6 Instrukcja \u2014 jak dzia\u0142aj\u0105 wagi i kiedy ich u\u017cywa\u0107", expanded=False):
+            st.markdown("""
+##### \U0001f3af Po co s\u0105 wagi?
+Wagi (ang. *weights* / *post-stratification weights*) to metoda **korygowania pr\u00f3by**, aby odzwierciedla\u0142a rzeczywiste proporcje w populacji. Je\u015bli w pr\u00f3bie jest np. 60% kobiet, a w populacji 50% \u2014 wyniki b\u0119d\u0105 zaburzone (\u201eprze-reprezentuj\u0105\u201d opinie kobiet). Wagi sprawiaj\u0105, \u017ce ka\u017cda obserwacja \"liczy si\u0119\" odpowiednio mniej lub wi\u0119cej, tak by odtworzy\u0107 za\u0142o\u017cone proporcje.
+
+##### \u2699\ufe0f Algorytm RIM (raking, iterative proportional fitting)
+W narz\u0119dziu u\u017cywana jest metoda **RIM** (ta sama co w SPSS). Dzia\u0142a tak:
+1. Ka\u017cda obserwacja dostaje startow\u0105 wag\u0119 = 1
+2. Dla ka\u017cdej zmiennej po kolei wagi s\u0105 korygowane tak, \u017ceby rozk\u0142ad tej zmiennej (wa\u017cony) pasowa\u0142 do celu
+3. Ta korekta psuje poprzednie dopasowania \u2014 wi\u0119c proces powtarza si\u0119 iteracyjnie a\u017c **wszystkie rozk\u0142ady jednocze\u015bnie** s\u0105 zgodne z celami
+4. Na ko\u0144cu wagi s\u0105 **normalizowane do sumy = N** (liczba obserwacji) \u2014 zgodnie z konwencj\u0105 SPSS
+
+##### \U0001f527 Jak ustawi\u0107 wagi \u2014 krok po kroku
+1. **Wybierz zmienne** po kt\u00f3rych chcesz wa\u017cy\u0107 (np. p\u0142e\u0107, wiek_grupa, region). Tylko zmienne z 2\u201310 kategoriami.
+2. Dla ka\u017cdej kategorii **wpisz docelowy odsetek** w populacji (np. Kobieta 50%, M\u0119\u017cczyzna 50%). **Suma musi wynosi\u0107 100%**.
+3. Kliknij **\u2696\ufe0f Oblicz wagi**. Narz\u0119dzie wykona iteracje RIM i zapisze wagi.
+4. Od tej chwili wszystkie analizy (cz\u0119sto\u015bci, \u015brednie, krzy\u017cowe, regresja, ANOVA\u2026) b\u0119d\u0105 **automatycznie liczone z uwzgl\u0119dnieniem wag**.
+
+##### \U0001f4ca Jak rozpozna\u0107 \u017ce wagi dzia\u0142aj\u0105
+- W nag\u0142\u00f3wku ka\u017cdego modu\u0142u pojawia si\u0119 **zielony pasek**: `\u2696\ufe0f Aktywne wagi: N=..., min=..., max=..., zmienne: ...`
+- W sidebarze checkbox **\"U\u017cyj wag w analizach\"** jest zaznaczony (mo\u017cesz go odznaczy\u0107 aby chwilowo zobaczy\u0107 niewa\u017cone wyniki bez usuwania wag)
+- Kolumny `N` w tabelach pokazuj\u0105 **wa\u017cone liczebno\u015bci** (zaokr\u0105glone do liczb ca\u0142kowitych)
+- \u015arednie, procenty, testy istotno\u015bci \u2014 wszystko uwzgl\u0119dnia wagi
+
+##### \U0001f4a1 Kluczowe fakty
+- **Suma wag = N** \u2014 dzi\u0119ki normalizacji SPSS-compatible wa\u017cona baza ma t\u0119 sam\u0105 wielko\u015b\u0107 co niewa\u017cona. Nie musisz si\u0119 martwi\u0107 o \u201esztucznie zawy\u017cone\u201d liczebno\u015bci.
+- **Min/Max wag** \u2014 warto\u015bci bliskie 1 (np. 0.7\u20131.3) oznaczaj\u0105 \u017ce pr\u00f3ba jest blisko populacji. Skrajne wagi (np. 0.2 lub 5.0) oznaczaj\u0105 znaczne skrzywienie pr\u00f3by \u2014 wyniki staj\u0105 si\u0119 mniej stabilne. Je\u015bli wagi s\u0105 bardzo rozstrzelone, rozwa\u017c **trimming** (obci\u0119cie skrajnych) lub sprawdzenie czy pr\u00f3ba w og\u00f3le nadaje si\u0119 do waszej populacji.
+- **Wagi + podzia\u0142 na podzbiory** \u2014 dzia\u0142aj\u0105 razem. W ka\u017cdej grupie podzia\u0142u wagi s\u0105 przycinane do obserwacji tej grupy; suma wag w grupie \u2248 liczba respondent\u00f3w w grupie.
+- **Testy istotno\u015bci przy wa\u017conych danych** \u2014 narz\u0119dzie u\u017cywa **efektywnej wielko\u015bci pr\u00f3by (ESS)** dla test\u00f3w t/F. Je\u015bli wagi s\u0105 bardzo nier\u00f3wne, ESS b\u0119dzie znacznie mniejsze ni\u017c N, co poprawnie koryguje obliczenia p-value.
+
+##### \U0001f504 Jak zmieni\u0107 / przeliczy\u0107 / usun\u0105\u0107 wagi
+- **Zmieni\u0107 cele** \u2014 rozwi\u0144 \"Aktualne cele wa\u017cenia\", edytuj warto\u015bci, kliknij \"Oblicz wagi\"
+- **Usun\u0105\u0107 wagi** \u2014 przycisk \"\U0001f5d1\ufe0f Usu\u0144 wagi\" wy\u015bwietlony obok podsumowania
+- **Chwilowo wy\u0142\u0105czy\u0107** \u2014 odznacz checkbox \"U\u017cyj wag w analizach\" w sidebarze; wagi zostaj\u0105 zapisane, ale nie s\u0105 stosowane
+
+##### \U0001f4be Zapis w projekcie
+Wagi i cele wa\u017cenia s\u0105 zapisywane w pliku projektu JSON \u2014 przy ponownym wczytaniu projektu zostan\u0105 przywr\u00f3cone bez potrzeby ponownego przeliczania.
+
+##### \u26a0\ufe0f Kiedy NIE nale\u017cy wa\u017cy\u0107?
+- Gdy pr\u00f3ba jest ju\u017c reprezentatywna (badania probabilistyczne, pe\u0142na populacja)
+- Gdy cele wa\u017cenia nie s\u0105 oparte na rzetelnych danych populacyjnych (wtedy wagi \u201enaprawiaj\u0105\u201d pr\u00f3b\u0119 do b\u0142\u0119dnego wzorca)
+- Gdy wagi b\u0119d\u0105 ekstremalnie nier\u00f3wne (> 5.0 albo < 0.2) \u2014 to znak \u017ce pr\u00f3ba jest za bardzo odbiegaj\u0105ca od populacji
+            """)
+
+        st.divider()
+
         # \u2500\u2500 Active weights summary \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         if st.session_state.weights is not None:
             w_arr = st.session_state.weights
@@ -3985,8 +4729,8 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
                         if not np.isclose(sum_w, 100.0, atol=0.1):
                             st.error(f"{get_var_display_name(wv, var_labels)}: suma = {sum_w:.1f}% (wymagane 100%)")
                             mod_valid = False
-                    if mod_valid and st.button("\u2696\ufe0f Przelicz wagi z nowymi celami", type="primary",
-                                               key="reweight_btn"):
+                    if mod_valid and _tracked_button("\u2696\ufe0f Przelicz wagi z nowymi celami", "prep", "recalculate_weights", type="primary",
+                                                    key="reweight_btn"):
                         st.session_state.weights = calculate_rim_weights(df, mod_targets)
                         st.session_state.weight_targets = mod_targets
                         st.success("\u2705 Wagi przeliczone!")
@@ -4021,16 +4765,114 @@ elif menu == "\U0001f6e0\ufe0f Przygotowanie Danych":
                 if not np.isclose(sum_pct, 100.0, atol=0.1):
                     st.error(f"Suma = {sum_pct:.1f}%. Musi wynosi\u0107 100%!")
                     valid_targets = False
-            if valid_targets and st.button("\u2696\ufe0f Oblicz wagi", type="primary", key="calc_weights"):
+            if valid_targets and _tracked_button("\u2696\ufe0f Oblicz wagi", "prep", "calculate_weights", type="primary", key="calc_weights"):
                 st.session_state.weights = calculate_rim_weights(df, targets)
                 st.session_state.weight_targets = targets
                 st.success("\u2705 Wagi obliczone!")
                 st.rerun()
 
+    # -- PODZIAL NA PODZBIORY (SPSS Split File) --------
+    with tab_split:
+        st.markdown("### \U0001f500 Podzia\u0142 analiz na podzbiory")
+        st.info(
+            "**Jak SPSS Split File.** Po wybraniu zmiennej grupuj\u0105cej wszystkie analizy "
+            "(cz\u0119sto\u015bci, krzy\u017cowe, \u015brednie, regresja, ANOVA itd.) zostan\u0105 wykonane "
+            "**osobno dla ka\u017cdej jej kategorii**. Np. wybieraj\u0105c `p\u0142e\u0107`, otrzymasz "
+            "osobne tabele dla Kobiet i M\u0119\u017cczyzn."
+        )
+
+        with st.expander("\U0001f4d6 Instrukcja \u2014 jak korzysta\u0107 z podzia\u0142u na podzbiory", expanded=False):
+            st.markdown("""
+##### \U0001f3af Do czego to s\u0142u\u017cy?
+Podzia\u0142 na podzbiory (odpowiednik **SPSS Split File**) pozwala automatycznie wykona\u0107 t\u0119 sam\u0105 analiz\u0119 **osobno dla ka\u017cdej grupy respondent\u00f3w**. Np. chcesz zobaczy\u0107 czy kobiety i m\u0119\u017cczy\u017ani r\u00f3\u017cni\u0105 si\u0119 w odpowiedziach \u2014 zamiast r\u0119cznie filtrowa\u0107 baz\u0119 dwa razy, jedno klikni\u0119cie daje osobne wyniki dla obu grup.
+
+##### \U0001f527 Jak w\u0142\u0105czy\u0107 podzia\u0142 \u2014 krok po kroku
+1. **Wybierz zmienn\u0105 grupuj\u0105c\u0105** z listy rozwijanej powy\u017cej. Pokazuj\u0105 si\u0119 tylko zmienne kategoryczne (2-20 unikalnych warto\u015bci), np. `p\u0142e\u0107`, `wiek_grupa`, `region`.
+2. Kliknij **\u2705 Zastosuj**. Na g\u00f3rze ekranu pojawi si\u0119 \u017c\u00f3\u0142ty pasek: `\U0001f500 Aktywny podzia\u0142 na podzbiory: [twoja zmienna]` \u2014 widoczny w ka\u017cdym module.
+3. **Przejd\u017a do dowolnej analizy** (Cz\u0119sto\u015bci, Krzy\u017cowe, Regresja, ANOVA itd.) i wygeneruj wyniki jak zwykle. System sam podzieli baz\u0119 na grupy.
+
+##### \U0001f4ca Jak rozpozna\u0107 wyniki z podzia\u0142em
+Ka\u017cdy wynik ma teraz w tytule etykiet\u0119 grupy oddzielon\u0105 znakiem `|`:
+- **Bez podzia\u0142u:** `Q1 \u2014 Ocena produktu`
+- **Z podzia\u0142em po `p\u0142e\u0107`:** pojawi\u0105 si\u0119 dwa wyniki:
+  - `Q1 \u2014 Ocena produktu | p\u0142e\u0107=Kobieta`
+  - `Q1 \u2014 Ocena produktu | p\u0142e\u0107=M\u0119\u017cczyzna`
+
+Wyniki kumuluj\u0105 si\u0119 \u2014 mo\u017cesz wykona\u0107 tak\u017ce analiz\u0119 bez podzia\u0142u, potem w\u0142\u0105czy\u0107 podzia\u0142 i zobaczy\u0107 obie wersje obok siebie.
+
+##### \U0001f501 Jak wy\u0142\u0105czy\u0107 podzia\u0142
+Wr\u00f3\u0107 do tej zak\u0142adki, wybierz z listy **`(brak - pe\u0142na baza)`** i kliknij **\u2705 Zastosuj**. Nast\u0119pne analizy b\u0119d\u0105 wykonywane na pe\u0142nej bazie.
+
+##### \U0001f4a1 Wa\u017cne
+- **Poprzednie wyniki nie s\u0105 kasowane.** W\u0142\u0105czenie / wy\u0142\u0105czenie podzia\u0142u nie zmienia ju\u017c wygenerowanych tabel \u2014 wp\u0142ywa tylko na kolejne analizy, kt\u00f3re uruchomisz.
+- **Ka\u017cdy modu\u0142 pami\u0119ta wyniki osobno** \u2014 np. mo\u017cesz mie\u0107 trzy tabele cz\u0119sto\u015bci tej samej zmiennej: jedn\u0105 dla pe\u0142nej bazy, jedn\u0105 dla Kobiet, jedn\u0105 dla M\u0119\u017cczyzn.
+- **Skupienia hierarchiczne** dzia\u0142aj\u0105 inaczej \u2014 dla ka\u017cdej grupy tworzona jest osobna zmienna w bazie (z sufiksem, np. `Skupienie_H_plec_Kobieta`), bo ka\u017cda grupa ma w\u0142asne klastry.
+- **Wa\u017cenie** (je\u015bli w\u0142\u0105czone) dzia\u0142a wewn\u0105trz ka\u017cdej grupy \u2014 wagi zostaj\u0105 odpowiednio przypisane do obserwacji tej grupy.
+- **Ma\u0142e grupy** \u2014 je\u015bli grupa ma za ma\u0142o obserwacji do danej analizy (np. <20 dla regresji), w tej grupie wynik zostanie pomini\u0119ty z komunikatem, ale inne grupy b\u0119d\u0105 policzone.
+
+##### \U0001f4be Zapis w projekcie
+Aktywny podzia\u0142 jest zapisywany w pliku projektu JSON \u2014 przy ponownym wczytaniu projektu podzia\u0142 zostanie przywr\u00f3cony.
+            """)
+
+        st.divider()
+
+        # Candidate variables: categorical with 2-20 unique values
+        _split_candidates = []
+        for c in df.columns:
+            try:
+                n_unique = df[c].dropna().nunique()
+                if 2 <= n_unique <= 20:
+                    _split_candidates.append(c)
+            except Exception:
+                pass
+
+        _current = st.session_state.split_var
+        _opts = ["(brak - pe\u0142na baza)"] + _split_candidates
+        _default_idx = _opts.index(_current) if _current in _opts else 0
+
+        split_choice = st.selectbox(
+            "Zmienna grupuj\u0105ca:",
+            _opts,
+            index=_default_idx,
+            format_func=lambda x: x if x == "(brak - pe\u0142na baza)"
+                                    else f"[{x}] {var_labels.get(x, x)}",
+            key="split_var_select",
+            help="Wybierz zmienn\u0105 kategoryczn\u0105 (2-20 kategorii). "
+                 "Wszystkie analizy b\u0119d\u0105 podzielone na grupy wg jej warto\u015bci."
+        )
+
+        if _tracked_button("\u2705 Zastosuj", "prep", "apply_split", type="primary", key="split_apply"):
+            new_val = None if split_choice == "(brak - pe\u0142na baza)" else split_choice
+            st.session_state.split_var = new_val
+            if new_val:
+                st.success(f"\u2705 Podzia\u0142 aktywny: `{new_val}`. Wszystkie analizy b\u0119d\u0105 liczone per grupa.")
+            else:
+                st.success("\u2705 Podzia\u0142 wy\u0142\u0105czony. Analizy wykonywane na pe\u0142nej bazie.")
+            st.rerun()
+
+        # Status
+        st.divider()
+        if st.session_state.split_var:
+            lbl = var_labels.get(st.session_state.split_var, st.session_state.split_var)
+            groups_preview = df[st.session_state.split_var].dropna().unique()
+            try:
+                groups_preview = sorted(groups_preview, key=lambda x: str(x))
+            except Exception:
+                pass
+            st.success(
+                f"\U0001f500 **Aktywny podzia\u0142:** `{st.session_state.split_var}` \u2014 {lbl}  \n"
+                f"**Liczba grup:** {len(groups_preview)}  \n"
+                f"**Grupy:** {', '.join(str(g) for g in groups_preview[:10])}"
+                + ("..." if len(groups_preview) > 10 else "")
+            )
+        else:
+            st.info("Brak aktywnego podzia\u0142u \u2014 analizy wykonywane na pe\u0142nej bazie.")
+
 # -------------------------------------------------------------
 # MODU? 3: ANALIZY I TABELE
 # -------------------------------------------------------------
 elif menu == "\U0001f4c8 Analizy i Tabele":
+    _require_module_access("analyses")
     module_header("\U0001f4c8", "Analizy i Tabele")
     tab_freq, tab_matrix_an, tab_cross, tab_means, tab_desc, tab_corr = st.tabs([
         "\U0001f4c8 Cz\u0119sto\u015bci", "\U0001f522 Pytania Matrycowe", "\U0001f500 Tabele Krzy\u017cowe", "\U0001f4ca \u015arednie (T-Test)", "\U0001f522 Statystyki Opisowe", "\U0001f517 Korelacje"
@@ -4039,80 +4881,88 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
     with tab_freq:
         freq_vars = st.multiselect("Wybierz zmienne:", all_options, format_func=lambda x: get_var_display_name(x, var_labels))
         show_charts_freq = st.checkbox("\U0001f4ca Wy\u015bwietlaj wykresy", key="charts_freq")
-        if st.button("\u25b6\ufe0f Generuj tablice cz\u0119sto\u015bci", type="primary") and freq_vars:
-            w = st.session_state.weights if use_weights else np.ones(len(df_raw))
+        if _tracked_button("\u25b6\ufe0f Generuj tablice cz\u0119sto\u015bci", "analyses", "freq_table", type="primary") and freq_vars:
+            _w_full = st.session_state.weights if use_weights else np.ones(len(df_raw))
             for freq_var in freq_vars:
-                if freq_var in st.session_state.matrix_sets:
-                    # Matrix variable -- show as transposed freq table
-                    mat_cols = st.session_state.matrix_sets[freq_var]
-                    try:
-                        mat_df, cats, sub_lbls = build_matrix_table(df, df_raw, mat_cols, var_labels, w, meta_orig.variable_value_labels, st.session_state.custom_val_labels)
-                        st.session_state.results['czestosci'][freq_var] = mat_df
-                        with st.expander(f"[Pytanie matrycowe] {freq_var}", expanded=True):
-                            pct_cols_m = [f"{s} [%]" for s in sub_lbls]
-                            n_cols_m   = [f"{s} [N]"  for s in sub_lbls]
-                            st.dataframe(
-                                mat_df.style
-                                    .format(lambda x: f"{x:.0f}" if isinstance(x, (int, float)) else x, subset=n_cols_m)
-                                    .format(lambda x: f"{x:.1f}%" if isinstance(x, (int, float)) else x, subset=pct_cols_m),
-                                use_container_width=True
-                            )
-                    except Exception as e:
-                        st.error(f"B\u0142\u0105d dla baterii {freq_var}: {e}")
-                    continue
+                # Iterate over split groups (single iteration if no split)
+                for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
+                        df, df_raw, var_labels, st.session_state.split_var,
+                        weights=_w_full):
+                    w = _w_s if _w_s is not None else np.ones(len(_df_raw_s))
+                    # Key in results dict includes group label to avoid overwrites
+                    result_key = f"{freq_var} | {_grp_lbl}" if _grp_lbl else freq_var
+                    expander_title = (f"{get_var_display_name(freq_var, var_labels)} \u2014 {_grp_lbl}"
+                                      if _grp_lbl else get_var_display_name(freq_var, var_labels))
+                    if freq_var in st.session_state.matrix_sets:
+                        # Matrix variable -- show as transposed freq table
+                        mat_cols = st.session_state.matrix_sets[freq_var]
+                        try:
+                            mat_df, cats, sub_lbls = build_matrix_table(_df_s, _df_raw_s, mat_cols, var_labels, w, meta_orig.variable_value_labels, st.session_state.custom_val_labels)
+                            st.session_state.results['czestosci'][result_key] = mat_df
+                            with st.expander(f"[Pytanie matrycowe] {expander_title}", expanded=True):
+                                pct_cols_m = [f"{s} [%]" for s in sub_lbls]
+                                n_cols_m   = [f"{s} [N]"  for s in sub_lbls]
+                                st.dataframe(
+                                    mat_df.style
+                                        .format(lambda x: f"{x:.0f}" if isinstance(x, (int, float)) else x, subset=n_cols_m)
+                                        .format(lambda x: f"{x:.1f}%" if isinstance(x, (int, float)) else x, subset=pct_cols_m),
+                                    use_container_width=True
+                                )
+                        except Exception as e:
+                            st.error(f"B\u0142\u0105d dla baterii {freq_var}: {e}")
+                        continue
 
-                if freq_var in st.session_state.mrs_sets:
-                    set_data = st.session_state.mrs_sets[freq_var]
-                    # Support both old format (list) and new format (dict)
-                    if isinstance(set_data, list):
-                        cols = set_data
-                        count_val = 1
+                    if freq_var in st.session_state.mrs_sets:
+                        set_data = st.session_state.mrs_sets[freq_var]
+                        if isinstance(set_data, list):
+                            cols = set_data
+                            count_val = 1
+                        else:
+                            cols = set_data.get('cols', [])
+                            count_val = set_data.get('count_val', 1)
+                        missing_mask = _df_raw_s[cols].isna().all(axis=1)
+                        missing_count = w[missing_mask].sum()
+                        counts = pd.Series({var_labels.get(c, c): w[(_df_raw_s[c] == count_val).values].sum() for c in cols})
+                        total_respondents = w[~missing_mask].sum()
+                        pcts = (counts / total_respondents) * 100 if total_respondents > 0 else counts * 0
+                        res_df = pd.DataFrame({'Liczebnosc [N]': counts, 'Procent [%]': pcts})
+                        res_df.loc['Og\u00f3\u0142em (Wa\u017cne)'] = [total_respondents, pcts.sum()]
+                        res_df.loc['Braki danych'] = [missing_count, np.nan]
                     else:
-                        cols = set_data.get('cols', [])
-                        count_val = set_data.get('count_val', 1)
-                    missing_mask = df_raw[cols].isna().all(axis=1)
-                    missing_count = w[missing_mask].sum()
-                    counts = pd.Series({var_labels.get(c, c): w[(df_raw[c] == count_val)].sum() for c in cols})
-                    total_respondents = w[~missing_mask].sum()
-                    pcts = (counts / total_respondents) * 100 if total_respondents > 0 else counts * 0
-                    res_df = pd.DataFrame({'Liczebnosc [N]': counts, 'Procent [%]': pcts})
-                    res_df.loc['Og\u00f3\u0142em (Wa\u017cne)'] = [total_respondents, pcts.sum()]
-                    res_df.loc['Braki danych'] = [missing_count, np.nan]
-                else:
-                    missing_mask = df[freq_var].isna()
-                    valid_df = pd.DataFrame({'val': df[freq_var], 'w': w}).dropna()
-                    counts = valid_df.groupby('val', observed=False)['w'].sum()
+                        missing_mask = _df_s[freq_var].isna()
+                        valid_df = pd.DataFrame({'val': _df_s[freq_var].values, 'w': w}).dropna()
+                        counts = valid_df.groupby('val', observed=False)['w'].sum()
 
-                    # Apply custom value labels to rename index (e.g. 1\u2192Kobieta)
-                    _cvl_freq = st.session_state.custom_val_labels.get(freq_var, {})
-                    if _cvl_freq:
-                        counts.index = counts.index.map(
-                            lambda x: _cvl_freq.get(str(x), _cvl_freq.get(x, x))
-                        )
-                    if freq_var in st.session_state.box_sets:
-                        for box_name, b_cats in st.session_state.box_sets[freq_var].items():
-                            box_val = counts[counts.index.isin(b_cats)].sum()
-                            counts.loc[box_name] = box_val
-                    pcts = (counts / valid_df['w'].sum()) * 100 if valid_df['w'].sum() > 0 else counts * 0
-                    res_df = pd.DataFrame({'Liczebnosc [N]': counts, 'Procent [%]': pcts})
-                    sum_n = counts[~counts.index.astype(str).str.startswith('[')].sum()
-                    res_df.loc['Suma'] = [sum_n, 100.0 if sum_n > 0 else 0]
+                        # Apply custom value labels to rename index (e.g. 1\u2192Kobieta)
+                        _cvl_freq = st.session_state.custom_val_labels.get(freq_var, {})
+                        if _cvl_freq:
+                            counts.index = counts.index.map(
+                                lambda x: _cvl_freq.get(str(x), _cvl_freq.get(x, x))
+                            )
+                        if freq_var in st.session_state.box_sets:
+                            for box_name, b_cats in st.session_state.box_sets[freq_var].items():
+                                box_val = counts[counts.index.isin(b_cats)].sum()
+                                counts.loc[box_name] = box_val
+                        pcts = (counts / valid_df['w'].sum()) * 100 if valid_df['w'].sum() > 0 else counts * 0
+                        res_df = pd.DataFrame({'Liczebnosc [N]': counts, 'Procent [%]': pcts})
+                        sum_n = counts[~counts.index.astype(str).str.startswith('[')].sum()
+                        res_df.loc['Suma'] = [sum_n, 100.0 if sum_n > 0 else 0]
 
-                    missing_count = w[missing_mask].sum()
-                    res_df.loc['Braki danych'] = [missing_count, np.nan]
-                st.session_state.results['czestosci'][freq_var] = res_df
-                with st.expander(get_var_display_name(freq_var, var_labels), expanded=True):
-                    st.dataframe(res_df.style.format(get_streamlit_format(res_df)), use_container_width=True)
-                    if show_charts_freq:
-                        plot_df = res_df.drop(index=['Suma', 'Og\u00f3\u0142em (Wa\u017cne)', 'Braki danych'], errors='ignore')
-                        plot_df = plot_df[~plot_df.index.astype(str).str.startswith('[')]
-                        if not plot_df.empty and 'Procent [%]' in plot_df.columns:
-                            plot_df = plot_df.dropna(subset=['Procent [%]'])
-                        if not plot_df.empty and 'Procent [%]' in plot_df.columns:
-                            fig = px.bar(plot_df, x='Procent [%]', y=plot_df.index, orientation='h',
-                                         title=var_labels.get(freq_var, freq_var), color_discrete_sequence=['#2E75B6'])
-                            fig.update_layout(yaxis={'categoryorder': 'total ascending'}, height=max(300, len(plot_df) * 30 + 80))
-                            st.plotly_chart(fig, use_container_width=True, key=f"pc_freq_gen_{freq_var}")
+                        missing_count = w[missing_mask.values].sum()
+                        res_df.loc['Braki danych'] = [missing_count, np.nan]
+                    st.session_state.results['czestosci'][result_key] = res_df
+                    with st.expander(expander_title, expanded=True):
+                        st.dataframe(res_df.style.format(get_streamlit_format(res_df)), use_container_width=True)
+                        if show_charts_freq:
+                            plot_df = res_df.drop(index=['Suma', 'Og\u00f3\u0142em (Wa\u017cne)', 'Braki danych'], errors='ignore')
+                            plot_df = plot_df[~plot_df.index.astype(str).str.startswith('[')]
+                            if not plot_df.empty and 'Procent [%]' in plot_df.columns:
+                                plot_df = plot_df.dropna(subset=['Procent [%]'])
+                            if not plot_df.empty and 'Procent [%]' in plot_df.columns:
+                                fig = px.bar(plot_df, x='Procent [%]', y=plot_df.index, orientation='h',
+                                             title=expander_title, color_discrete_sequence=['#2E75B6'])
+                                fig.update_layout(yaxis={'categoryorder': 'total ascending'}, height=max(300, len(plot_df) * 30 + 80))
+                                st.plotly_chart(fig, use_container_width=True, key=f"pc_freq_gen_{result_key}")
             st.success("\u2705 Tablice cz\u0119sto\u015bci wygenerowane!")
 
         # \u2500\u2500 Persistent display of stored results \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -4126,15 +4976,20 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
                     st.session_state.results['czestosci'] = {}
                     st.rerun()
             for freq_var, res_df in list(st.session_state.results['czestosci'].items()):
+                _base_var, _grp_lbl = _extract_split_from_title(freq_var)
                 _ec1, _ec2 = st.columns([6, 1])
                 with _ec1:
-                    _exp = st.expander(get_var_display_name(freq_var, var_labels), expanded=False)
+                    _display_title = get_var_display_name(_base_var, var_labels)
+                    if _grp_lbl:
+                        _display_title += f" \u2014 \U0001f500 {_grp_lbl}"
+                    _exp = st.expander(_display_title, expanded=False)
                 with _ec2:
                     if st.button("\U0001f5d1\ufe0f", key=f"del_freq_{freq_var}",
                                  help=f"Usu\u0144 wynik dla {freq_var}"):
                         st.session_state.results['czestosci'].pop(freq_var, None)
                         st.rerun()
                 with _exp:
+                    _split_badge(_grp_lbl)
                     st.dataframe(res_df.style.format(get_streamlit_format(res_df)),
                                  use_container_width=True)
                     if show_charts_freq:
@@ -4174,19 +5029,23 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
             with col_chart:
                 show_chart_mat = st.checkbox("\U0001f4ca Wy\u015bwietl wykres", key="chart_mat")
 
-            if st.button("\u25b6\ufe0f Generuj tabele matrycowe", type="primary", key="gen_matrix"):
-                w = st.session_state.weights if use_weights else np.ones(len(df_raw))
-                for mat_name in mat_sel:
-                    mat_cols = st.session_state.matrix_sets[mat_name]
-                    try:
-                        mat_df, cats, sub_lbls = build_matrix_table(df, df_raw, mat_cols, var_labels, w, meta_orig.variable_value_labels, st.session_state.custom_val_labels)
-                        _merge_result(st.session_state.matrix_results, {
-                            'name': mat_name, 'df': mat_df, 'cats': cats,
-                            'sub_labels': sub_lbls, 'cols': mat_cols,
-                            'display_mode': mat_display_mode,
-                        }, key_fn=lambda r: r['name'])
-                    except Exception as e:
-                        st.error(f"B\u0142\u0105d dla '{mat_name}': {e}")
+            if _tracked_button("\u25b6\ufe0f Generuj tabele matrycowe", "analyses", "matrix_table", type="primary", key="gen_matrix"):
+                _w_full = st.session_state.weights if use_weights else np.ones(len(df_raw))
+                for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
+                        df, df_raw, var_labels, st.session_state.split_var, weights=_w_full):
+                    w = _w_s if _w_s is not None else np.ones(len(_df_raw_s))
+                    for mat_name in mat_sel:
+                        mat_cols = st.session_state.matrix_sets[mat_name]
+                        try:
+                            mat_df, cats, sub_lbls = build_matrix_table(_df_s, _df_raw_s, mat_cols, var_labels, w, meta_orig.variable_value_labels, st.session_state.custom_val_labels)
+                            entry_name = f"{mat_name} | {_grp_lbl}" if _grp_lbl else mat_name
+                            _merge_result(st.session_state.matrix_results, {
+                                'name': entry_name, 'df': mat_df, 'cats': cats,
+                                'sub_labels': sub_lbls, 'cols': mat_cols,
+                                'display_mode': mat_display_mode,
+                            }, key_fn=lambda r: r['name'])
+                        except Exception as e:
+                            st.error(f"B\u0142\u0105d dla '{mat_name}': {e}")
                 st.success(f"\u2705 Wygenerowano {len(st.session_state.matrix_results)} tabel matrycowych.")
 
             if st.session_state.matrix_results:
@@ -4199,15 +5058,20 @@ elif menu == "\U0001f4c8 Analizy i Tabele":
                         st.rerun()
 
             for _mi, entry in enumerate(list(st.session_state.matrix_results)):
+                _base_n, _grp_n = _extract_split_from_title(entry['name'])
                 _mtc1, _mtc2 = st.columns([6, 1])
                 with _mtc1:
-                    _mtexp = st.expander(f"\U0001f522 {entry['name']}", expanded=True)
+                    _mtexp = st.expander(
+                        f"\U0001f522 {_base_n}" + (f" \u2014 \U0001f500 {_grp_n}" if _grp_n else ""),
+                        expanded=True
+                    )
                 with _mtc2:
                     if st.button("\U0001f5d1\ufe0f", key=f"del_matrix_{_mi}",
                                  help=f"Usu\u0144 {entry['name']}"):
                         st.session_state.matrix_results.pop(_mi)
                         st.rerun()
                 with _mtexp:
+                    _split_badge(_grp_n)
                     mat_df   = entry['df']
                     cats     = entry['cats']
                     sub_lbls = entry.get('sub_labels', [])
@@ -4355,146 +5219,190 @@ Pozwala sprawdzi\u0107 czy istnieje zwi\u0105zek mi\u0119dzy dwiema zmiennymi ka
         do_cramer = c3.checkbox("\U0001f4cf V Kramera", help="Si\u0142a zwi\u0105zku: 0=brak, 0.1=s\u0142aby, 0.3=umiarkowany, 0.5+=silny")
         show_charts_cross = c4.checkbox("\U0001f4ca Wykresy")
 
-        if st.button("\u25b6\ufe0f Generuj tabele krzy\u017cowe", type="primary") and row_vars and col_vars:
-            w = st.session_state.weights if use_weights else np.ones(len(df_raw))
-            for row_var in row_vars:
-                for col_var in col_vars:
-                    is_row_mrs = row_var in st.session_state.mrs_sets
-                    is_col_mrs = col_var in st.session_state.mrs_sets
-                    try:
-                        tmp_df = pd.DataFrame({'w': w})
-                        if is_row_mrs: tmp_df['R_miss'] = df_raw[st.session_state.mrs_sets[row_var]].isna().all(axis=1)
-                        else: tmp_df['R_miss'] = df[row_var].isna()
-                        if is_col_mrs: tmp_df['C_miss'] = df_raw[st.session_state.mrs_sets[col_var]].isna().all(axis=1)
-                        else: tmp_df['C_miss'] = df[col_var].isna()
-                        missing_count = tmp_df.loc[tmp_df['R_miss'] | tmp_df['C_miss'], 'w'].sum()
+        if _tracked_button("\u25b6\ufe0f Generuj tabele krzy\u017cowe", "analyses", "crosstab", type="primary") and row_vars and col_vars:
+            _w_full = st.session_state.weights if use_weights else np.ones(len(df_raw))
+            for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
+                    df, df_raw, var_labels, st.session_state.split_var, weights=_w_full):
+                w = _w_s if _w_s is not None else np.ones(len(_df_raw_s))
+                for row_var in row_vars:
+                    for col_var in col_vars:
+                        is_row_mrs = row_var in st.session_state.mrs_sets
+                        is_col_mrs = col_var in st.session_state.mrs_sets
+                        try:
+                            tmp_df = pd.DataFrame({'w': w})
+                            if is_row_mrs: tmp_df['R_miss'] = _df_raw_s[st.session_state.mrs_sets[row_var]].isna().all(axis=1).values
+                            else: tmp_df['R_miss'] = _df_s[row_var].isna().values
+                            if is_col_mrs: tmp_df['C_miss'] = _df_raw_s[st.session_state.mrs_sets[col_var]].isna().all(axis=1).values
+                            else: tmp_df['C_miss'] = _df_s[col_var].isna().values
+                            missing_count = tmp_df.loc[tmp_df['R_miss'] | tmp_df['C_miss'], 'w'].sum()
 
-                        if not is_row_mrs and not is_col_mrs:
-                            df_n = pd.crosstab(df[row_var], df[col_var], values=w, aggfunc='sum', dropna=False).fillna(0)
-                        elif is_row_mrs and not is_col_mrs:
-                            cols = st.session_state.mrs_sets[row_var]
-                            mrs_w = df_raw[cols].replace(np.nan, 0).multiply(w, axis=0)
-                            df_n = mrs_w.groupby(df[col_var], observed=False).sum().T
-                            df_n.index = [var_labels.get(c, c) for c in df_n.index]
-                        elif not is_row_mrs and is_col_mrs:
-                            cols = st.session_state.mrs_sets[col_var]
-                            mrs_w = df_raw[cols].replace(np.nan, 0).multiply(w, axis=0)
-                            df_n = mrs_w.groupby(df[row_var], observed=False).sum()
-                            df_n.columns = [var_labels.get(c, c) for c in df_n.columns]
-
-                        if row_var in st.session_state.box_sets and not is_row_mrs:
-                            for box_name, b_cats in st.session_state.box_sets[row_var].items():
-                                df_n.loc[box_name] = df_n.loc[df_n.index.intersection(b_cats)].sum(axis=0)
-
-                        if (do_chi_square or do_cramer) and not is_row_mrs and not is_col_mrs:
-                            obs = df_n.loc[~df_n.index.astype(str).str.startswith('[')]
-                            obs = obs[[c for c in obs.columns if not str(c).startswith('[') and c != 'Suma']]
-                            if obs.shape[0] > 1 and obs.shape[1] > 1 and obs.sum().sum() > 0:
-                                chi2, p, dof, ex = stats.chi2_contingency(obs)
-                                n_total = obs.sum().sum()
-                                k = min(obs.shape[0], obs.shape[1])
-                                cramer_v = float(np.sqrt(chi2 / (n_total * (k - 1)))) if n_total > 0 and k > 1 else 0.0
-
-                                # Interpret Cramer's V
-                                if cramer_v < 0.1:
-                                    v_interp = "brak/zaniedbywalny"
-                                elif cramer_v < 0.3:
-                                    v_interp = "s\u0142aby"
-                                elif cramer_v < 0.5:
-                                    v_interp = "umiarkowany"
-                                else:
-                                    v_interp = "silny"
-
-                                parts = []
-                                if do_chi_square:
-                                    parts.append(f"Chi\u00b2={chi2:.2f}, df={dof}, p={p:.3f}")
-                                if do_cramer:
-                                    parts.append(f"V Kramera={cramer_v:.3f} ({v_interp})")
-                                st.session_state.chi_results[f"{row_var} x {col_var}"] = " | ".join(parts)
-
-                        if not is_row_mrs and not is_col_mrs:
-                            df_n['Suma'] = df_n.loc[~df_n.index.astype(str).str.startswith('[')].sum(axis=1)
-                            df_n.loc['Suma'] = df_n.loc[~df_n.index.astype(str).str.startswith('[')].sum(axis=0)
-                        elif is_row_mrs and not is_col_mrs:
-                            df_n['Suma'] = mrs_w.sum().values
-                            df_n.loc['Suma'] = df_n.sum(axis=0)
-                        elif not is_row_mrs and is_col_mrs:
-                            df_n['Suma'] = df_n.loc[~df_n.index.astype(str).str.startswith('[')].sum(axis=1)
-                            df_n.loc['Suma'] = mrs_w.sum().values.tolist() + [mrs_w.sum().sum()]
-
-                        df_pct = pd.DataFrame(np.nan, index=df_n.index, columns=df_n.columns)
-                        if "Kolumnowe" in pct_type:
-                            if not is_row_mrs and not is_col_mrs: df_pct = df_n.div(df_n.loc['Suma'].replace(0, np.nan), axis=1) * 100
+                            if not is_row_mrs and not is_col_mrs:
+                                df_n = pd.crosstab(_df_s[row_var], _df_s[col_var], values=w, aggfunc='sum', dropna=False).fillna(0)
                             elif is_row_mrs and not is_col_mrs:
-                                base = tmp_df.loc[~tmp_df['C_miss']].groupby(df[col_var], observed=False)['w'].sum()
-                                base['Suma'] = base.sum()
-                                df_pct = df_n.div(base.replace(0, np.nan), axis=1) * 100
+                                cols = st.session_state.mrs_sets[row_var]
+                                mrs_w = _df_raw_s[cols].replace(np.nan, 0).multiply(w, axis=0)
+                                df_n = mrs_w.groupby(_df_s[col_var].values, observed=False).sum().T
+                                df_n.index = [var_labels.get(c, c) for c in df_n.index]
                             elif not is_row_mrs and is_col_mrs:
-                                df_pct = df_n.div(df_n.loc['Suma'].replace(0, np.nan), axis=1) * 100
-                        elif "Wierszowe" in pct_type:
-                            if not is_row_mrs and not is_col_mrs: df_pct = df_n.div(df_n['Suma'].replace(0, np.nan), axis=0) * 100
-                            elif is_row_mrs and not is_col_mrs: df_pct = df_n.div(df_n['Suma'].replace(0, np.nan), axis=0) * 100
-                            elif not is_row_mrs and is_col_mrs:
-                                base = tmp_df.loc[~tmp_df['R_miss']].groupby(df[row_var], observed=False)['w'].sum()
-                                for box_name, b_cats in st.session_state.box_sets.get(row_var, {}).items():
-                                    base[box_name] = base[base.index.intersection(b_cats)].sum()
-                                base['Suma'] = base.loc[~base.index.astype(str).str.startswith('[')].sum()
-                                df_pct = df_n.div(base.replace(0, np.nan), axis=0) * 100
+                                cols = st.session_state.mrs_sets[col_var]
+                                mrs_w = _df_raw_s[cols].replace(np.nan, 0).multiply(w, axis=0)
+                                df_n = mrs_w.groupby(_df_s[row_var].values, observed=False).sum()
+                                df_n.columns = [var_labels.get(c, c) for c in df_n.columns]
 
-                        if "Kolumnowe" in pct_type or "Wierszowe" in pct_type:
-                            df_pct = df_pct.fillna(0)
+                            if row_var in st.session_state.box_sets and not is_row_mrs:
+                                for box_name, b_cats in st.session_state.box_sets[row_var].items():
+                                    df_n.loc[box_name] = df_n.loc[df_n.index.intersection(b_cats)].sum(axis=0)
 
-                        if do_sig_test and "Kolumnowe" in pct_type:
-                            sig_df, col_letters = apply_sig_testing(df_pct, df_n)
-                            rename_dict = {c: f"{c} [{col_letters.get(c, '')}]" for c in df_n.columns if c != 'Suma'}
-                            df_n.rename(columns=rename_dict, inplace=True)
-                            df_pct.rename(columns=rename_dict, inplace=True)
-                            sig_df.rename(columns=rename_dict, inplace=True)
-                            df_pct_str = pd.DataFrame("", index=df_pct.index, columns=df_pct.columns)
-                            for c in df_pct.columns:
-                                df_pct_str[c] = df_pct[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
-                            df_pct = df_pct_str + sig_df
+                            title_base = f"{row_var} x {col_var}"
+                            title = f"{title_base} | {_grp_lbl}" if _grp_lbl else title_base
 
-                        if pct_type == "Liczebno\u015bci":
-                            cross_df = df_n.add_suffix(' [N]')
-                        elif pct_type in ["Kolumnowe (%)", "Wierszowe (%)"]:
-                            cross_df = df_pct.add_suffix(' [%]')
-                        else:
-                            p_lbl = "[% Kolumnowe]" if "Kolumnowe" in pct_type else "[% Wierszowe]"
-                            cross_cols = []
-                            for c in df_n.columns:
-                                cross_cols.extend([f"{c} [N]", f"{c} {p_lbl}"])
-                            cross_df = pd.DataFrame(index=df_n.index, columns=cross_cols)
-                            for c in df_n.columns:
-                                cross_df[f"{c} [N]"] = df_n[c]
-                                cross_df[f"{c} {p_lbl}"] = df_pct[c]
+                            if (do_chi_square or do_cramer) and not is_row_mrs and not is_col_mrs:
+                                obs = df_n.loc[~df_n.index.astype(str).str.startswith('[')]
+                                obs = obs[[c for c in obs.columns if not str(c).startswith('[') and c != 'Suma']]
 
-                        cross_df.loc['Braki danych (wykluczone z tabeli)'] = [missing_count] + [np.nan] * (len(cross_df.columns) - 1)
-                        title = f"{row_var} x {col_var}"
-                        st.session_state.results['krzyzowe'][title] = cross_df
-                        with st.expander(title):
-                            st.dataframe(safe_style(cross_df), use_container_width=True)
-                            if title in st.session_state.chi_results:
-                                st.caption(f"\U0001f9ee {st.session_state.chi_results[title]}")
-                            if show_charts_cross:
-                                plot_df = cross_df.drop(index=['Suma', 'Braki danych', 'Braki danych (wykluczone z tabeli)'], errors='ignore')
-                                plot_df = plot_df[~plot_df.index.astype(str).str.startswith('[')]
-                                if "Kolumnowe" in pct_type or "Wierszowe" in pct_type:
-                                    p_cols = [c for c in plot_df.columns if '[%]' in c or '[% Kolumnowe]' in c or '[% Wierszowe]' in c]
+                                # Pre-check: identify empty rows/columns BEFORE calling scipy
+                                _row_sums = obs.sum(axis=1)
+                                _col_sums = obs.sum(axis=0)
+                                _empty_rows = _row_sums[_row_sums == 0].index.tolist()
+                                _empty_cols = _col_sums[_col_sums == 0].index.tolist()
+
+                                if obs.shape[0] <= 1 or obs.shape[1] <= 1:
+                                    st.session_state.chi_results[title] = (
+                                        "\u26a0\ufe0f Test nie mo\u017ce by\u0107 wykonany: tabela musi mie\u0107 co najmniej 2 wiersze i 2 kolumny "
+                                        "(po usuni\u0119ciu zagregowanych wierszy/kolumn)."
+                                    )
+                                elif obs.sum().sum() == 0:
+                                    st.session_state.chi_results[title] = (
+                                        "\u26a0\ufe0f Test nie mo\u017ce by\u0107 wykonany: tabela jest ca\u0142kowicie pusta (wszystkie liczebno\u015bci = 0)."
+                                    )
+                                elif _empty_rows or _empty_cols:
+                                    _msg_parts = []
+                                    if _empty_rows:
+                                        _msg_parts.append(f"wiersze bez obserwacji: {', '.join(str(r) for r in _empty_rows)}")
+                                    if _empty_cols:
+                                        _msg_parts.append(f"kolumny bez obserwacji: {', '.join(str(c) for c in _empty_cols)}")
+                                    st.session_state.chi_results[title] = (
+                                        "\u26a0\ufe0f Test Chi\u00b2 niedost\u0119pny \u2014 " + "; ".join(_msg_parts) + ". "
+                                        "Przyczyna: te kategorie istniej\u0105 w s\u0142owniku warto\u015bci, ale nikt ich nie wybra\u0142 "
+                                        "(lub wszystkie odpowiedzi w tej kategorii s\u0105 zakodowane jako braki). "
+                                        "Aby wykona\u0107 test: usu\u0144 nieu\u017cywane kategorie w zak\u0142adce Etykiety warto\u015bci "
+                                        "lub dodaj je do brak\u00f3w danych."
+                                    )
                                 else:
-                                    p_cols = [c for c in plot_df.columns if '[N]' in c]
-                                p_cols = [c for c in p_cols if 'Suma' not in c]
-                                if p_cols and not plot_df.empty:
-                                    temp_plot = plot_df[p_cols].copy()
-                                    for col in temp_plot.columns:
-                                        temp_plot[col] = pd.to_numeric(temp_plot[col].apply(lambda x: str(x).split('%')[0].strip() if isinstance(x, str) else x), errors='coerce')
-                                    temp_plot.columns = [c.split(' [')[0] for c in temp_plot.columns]
-                                    fig = px.bar(temp_plot, barmode='group', orientation='h',
-                                                 title=f"{var_labels.get(row_var, row_var)} wg {var_labels.get(col_var, col_var)}")
-                                    fig.update_layout(yaxis={'categoryorder': 'total ascending'}, height=350)
-                                    st.plotly_chart(fig, use_container_width=True, key=f"pc_cross_{title}")
-                    except Exception as e:
-                        st.error(f"B\u0142\u0105d dla {row_var} \u00d7 {col_var}: {e}")
+                                    try:
+                                        chi2, p, dof, ex = stats.chi2_contingency(obs)
+                                        n_total = obs.sum().sum()
+                                        k = min(obs.shape[0], obs.shape[1])
+                                        cramer_v = float(np.sqrt(chi2 / (n_total * (k - 1)))) if n_total > 0 and k > 1 else 0.0
+
+                                        if cramer_v < 0.1: v_interp = "brak/zaniedbywalny"
+                                        elif cramer_v < 0.3: v_interp = "s\u0142aby"
+                                        elif cramer_v < 0.5: v_interp = "umiarkowany"
+                                        else: v_interp = "silny"
+
+                                        parts = []
+                                        if do_chi_square:
+                                            parts.append(f"Chi\u00b2={chi2:.2f}, df={dof}, p={p:.3f}")
+                                        if do_cramer:
+                                            parts.append(f"V Kramera={cramer_v:.3f} ({v_interp})")
+
+                                        # Warn if >20% of cells have expected < 5 (Cochran's rule)
+                                        _low_expected = int((ex < 5).sum())
+                                        _total_cells = ex.size
+                                        if _total_cells > 0 and _low_expected / _total_cells > 0.20:
+                                            parts.append(
+                                                f"\u26a0\ufe0f {_low_expected}/{_total_cells} kom\u00f3rek ma oczekiwan\u0105 liczebno\u015b\u0107 < 5 "
+                                                "(test mo\u017ce by\u0107 niestabilny; rozwa\u017c Fisher Exact lub \u0142\u0105czenie kategorii)"
+                                            )
+                                        st.session_state.chi_results[title] = " | ".join(parts)
+                                    except Exception as _chi_err:
+                                        st.session_state.chi_results[title] = (
+                                            f"\u26a0\ufe0f Test Chi\u00b2 nie powi\u00f3d\u0142 si\u0119: {_chi_err}. "
+                                            "Sprawd\u017a czy w tabeli nie ma pustych wierszy/kolumn."
+                                        )
+
+                            if not is_row_mrs and not is_col_mrs:
+                                df_n['Suma'] = df_n.loc[~df_n.index.astype(str).str.startswith('[')].sum(axis=1)
+                                df_n.loc['Suma'] = df_n.loc[~df_n.index.astype(str).str.startswith('[')].sum(axis=0)
+                            elif is_row_mrs and not is_col_mrs:
+                                df_n['Suma'] = mrs_w.sum().values
+                                df_n.loc['Suma'] = df_n.sum(axis=0)
+                            elif not is_row_mrs and is_col_mrs:
+                                df_n['Suma'] = df_n.loc[~df_n.index.astype(str).str.startswith('[')].sum(axis=1)
+                                df_n.loc['Suma'] = mrs_w.sum().values.tolist() + [mrs_w.sum().sum()]
+
+                            df_pct = pd.DataFrame(np.nan, index=df_n.index, columns=df_n.columns)
+                            if "Kolumnowe" in pct_type:
+                                if not is_row_mrs and not is_col_mrs: df_pct = df_n.div(df_n.loc['Suma'].replace(0, np.nan), axis=1) * 100
+                                elif is_row_mrs and not is_col_mrs:
+                                    base = tmp_df.loc[~tmp_df['C_miss']].groupby(_df_s[col_var].values, observed=False)['w'].sum()
+                                    base['Suma'] = base.sum()
+                                    df_pct = df_n.div(base.replace(0, np.nan), axis=1) * 100
+                                elif not is_row_mrs and is_col_mrs:
+                                    df_pct = df_n.div(df_n.loc['Suma'].replace(0, np.nan), axis=1) * 100
+                            elif "Wierszowe" in pct_type:
+                                if not is_row_mrs and not is_col_mrs: df_pct = df_n.div(df_n['Suma'].replace(0, np.nan), axis=0) * 100
+                                elif is_row_mrs and not is_col_mrs: df_pct = df_n.div(df_n['Suma'].replace(0, np.nan), axis=0) * 100
+                                elif not is_row_mrs and is_col_mrs:
+                                    base = tmp_df.loc[~tmp_df['R_miss']].groupby(_df_s[row_var].values, observed=False)['w'].sum()
+                                    for box_name, b_cats in st.session_state.box_sets.get(row_var, {}).items():
+                                        base[box_name] = base[base.index.intersection(b_cats)].sum()
+                                    base['Suma'] = base.loc[~base.index.astype(str).str.startswith('[')].sum()
+                                    df_pct = df_n.div(base.replace(0, np.nan), axis=0) * 100
+
+                            if "Kolumnowe" in pct_type or "Wierszowe" in pct_type:
+                                df_pct = df_pct.fillna(0)
+
+                            if do_sig_test and "Kolumnowe" in pct_type:
+                                sig_df, col_letters = apply_sig_testing(df_pct, df_n)
+                                rename_dict = {c: f"{c} [{col_letters.get(c, '')}]" for c in df_n.columns if c != 'Suma'}
+                                df_n.rename(columns=rename_dict, inplace=True)
+                                df_pct.rename(columns=rename_dict, inplace=True)
+                                sig_df.rename(columns=rename_dict, inplace=True)
+                                df_pct_str = pd.DataFrame("", index=df_pct.index, columns=df_pct.columns)
+                                for c in df_pct.columns:
+                                    df_pct_str[c] = df_pct[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
+                                df_pct = df_pct_str + sig_df
+
+                            if pct_type == "Liczebno\u015bci":
+                                cross_df = df_n.add_suffix(' [N]')
+                            elif pct_type in ["Kolumnowe (%)", "Wierszowe (%)"]:
+                                cross_df = df_pct.add_suffix(' [%]')
+                            else:
+                                p_lbl = "[% Kolumnowe]" if "Kolumnowe" in pct_type else "[% Wierszowe]"
+                                cross_cols = []
+                                for c in df_n.columns:
+                                    cross_cols.extend([f"{c} [N]", f"{c} {p_lbl}"])
+                                cross_df = pd.DataFrame(index=df_n.index, columns=cross_cols)
+                                for c in df_n.columns:
+                                    cross_df[f"{c} [N]"] = df_n[c]
+                                    cross_df[f"{c} {p_lbl}"] = df_pct[c]
+
+                            cross_df.loc['Braki danych (wykluczone z tabeli)'] = [missing_count] + [np.nan] * (len(cross_df.columns) - 1)
+                            st.session_state.results['krzyzowe'][title] = cross_df
+                            with st.expander(title):
+                                st.dataframe(safe_style(cross_df), use_container_width=True)
+                                if title in st.session_state.chi_results:
+                                    st.caption(f"\U0001f9ee {st.session_state.chi_results[title]}")
+                                if show_charts_cross:
+                                    plot_df = cross_df.drop(index=['Suma', 'Braki danych', 'Braki danych (wykluczone z tabeli)'], errors='ignore')
+                                    plot_df = plot_df[~plot_df.index.astype(str).str.startswith('[')]
+                                    if "Kolumnowe" in pct_type or "Wierszowe" in pct_type:
+                                        p_cols = [c for c in plot_df.columns if '[%]' in c or '[% Kolumnowe]' in c or '[% Wierszowe]' in c]
+                                    else:
+                                        p_cols = [c for c in plot_df.columns if '[N]' in c]
+                                    p_cols = [c for c in p_cols if 'Suma' not in c]
+                                    if p_cols and not plot_df.empty:
+                                        temp_plot = plot_df[p_cols].copy()
+                                        for col in temp_plot.columns:
+                                            temp_plot[col] = pd.to_numeric(temp_plot[col].apply(lambda x: str(x).split('%')[0].strip() if isinstance(x, str) else x), errors='coerce')
+                                        temp_plot.columns = [c.split(' [')[0] for c in temp_plot.columns]
+                                        fig = px.bar(temp_plot, barmode='group', orientation='h',
+                                                     title=title)
+                                        fig.update_layout(yaxis={'categoryorder': 'total ascending'}, height=350)
+                                        st.plotly_chart(fig, use_container_width=True, key=f"pc_cross_{title}")
+                        except Exception as e:
+                            st.error(f"B\u0142\u0105d dla {row_var} \u00d7 {col_var}: {e}")
             st.success("\u2705 Tabele krzy\u017cowe wygenerowane!")
 
         # \u2500\u2500 Persistent display of stored cross-tab results \u2500\u2500\u2500\u2500
@@ -4512,7 +5420,9 @@ Pozwala sprawdzi\u0107 czy istnieje zwi\u0105zek mi\u0119dzy dwiema zmiennymi ka
             for title, cross_df in list(st.session_state.results['krzyzowe'].items()):
                 _xc1, _xc2 = st.columns([6, 1])
                 with _xc1:
-                    _xexp = st.expander(title, expanded=False)
+                    _base_x, _grp_x = _extract_split_from_title(title)
+                    _title_display = _base_x + (f" \u2014 \U0001f500 {_grp_x}" if _grp_x else "")
+                    _xexp = st.expander(_title_display, expanded=False)
                 with _xc2:
                     if st.button("\U0001f5d1\ufe0f", key=f"del_cross_{title}",
                                  help=f"Usu\u0144 {title}"):
@@ -4520,6 +5430,7 @@ Pozwala sprawdzi\u0107 czy istnieje zwi\u0105zek mi\u0119dzy dwiema zmiennymi ka
                         st.session_state.chi_results.pop(title, None)
                         st.rerun()
                 with _xexp:
+                    _split_badge(_grp_x)
                     st.dataframe(safe_style(cross_df), use_container_width=True)
                     if title in st.session_state.chi_results:
                         st.caption(f"\U0001f9ee {st.session_state.chi_results[title]}")
@@ -4529,48 +5440,52 @@ Pozwala sprawdzi\u0107 czy istnieje zwi\u0105zek mi\u0119dzy dwiema zmiennymi ka
         with col1: mean_rows = st.multiselect("Zmienne ci\u0105g\u0142e (wiersze):", numeric_cols, format_func=lambda x: get_var_display_name(x, var_labels))
         with col2: mean_cols_sel = st.multiselect("Metryczka (kolumny):", all_options, format_func=lambda x: get_var_display_name(x, var_labels))
         do_means_sig = st.checkbox("\U0001f520 Oznacz istotne r\u00f3\u017cnice \u015brednich (T-Test 95%)")
-        if st.button("\u25b6\ufe0f Generuj tabele \u015brednich", type="primary") and mean_rows and mean_cols_sel:
-            w = st.session_state.weights if use_weights else np.ones(len(df_raw))
-            for row_var in mean_rows:
-                for col_var in mean_cols_sel:
-                    try:
-                        x = pd.to_numeric(df_raw[row_var], errors='coerce')
-                        c_series = df[col_var]
-                        cats = c_series.dropna().unique()
-                        df_means = pd.DataFrame(index=['Srednia', 'Odchylenie Std.', 'Baza (N)'], columns=cats)
-                        df_vars = pd.DataFrame(index=['Srednia'], columns=cats)
-                        df_ess = pd.DataFrame(index=['Srednia'], columns=cats)
-                        for cat in cats:
-                            mask = (c_series == cat)
-                            mean, var, ess = get_weighted_stats(x[mask].values, w[mask])
-                            std = np.sqrt(var) if pd.notna(var) and var >= 0 else np.nan
-                            df_means.loc['Srednia', cat] = mean
-                            df_means.loc['Odchylenie Std.', cat] = std
-                            df_means.loc['Baza (N)', cat] = w[mask & ~np.isnan(x)].sum()
-                            df_vars.loc['Srednia', cat] = var
-                            df_ess.loc['Srednia', cat] = ess
-                        mean, var, ess = get_weighted_stats(x.values, w)
-                        df_means['Og\u00f3\u0142em'] = [mean, np.sqrt(var) if pd.notna(var) and var >= 0 else np.nan, w[~np.isnan(x)].sum()]
-                        df_vars['Og\u00f3\u0142em'] = var
-                        df_ess['Og\u00f3\u0142em'] = ess
-                        if do_means_sig:
-                            sig_df, col_letters = apply_means_sig_testing(df_means.loc[['Srednia']], df_vars.loc[['Srednia']], df_ess.loc[['Srednia']])
-                            rename_dict = {c: f"{c} [{col_letters.get(c, '')}]" for c in cats}
-                            df_means.rename(columns=rename_dict, inplace=True)
-                            sig_df.rename(columns=rename_dict, inplace=True)
-                            df_str = pd.DataFrame("", index=df_means.index, columns=df_means.columns)
-                            for c in df_means.columns:
-                                df_str.loc['Srednia', c] = f"{df_means.loc['Srednia', c]:.2f}" if pd.notna(df_means.loc['Srednia', c]) else ""
-                                df_str.loc['Odchylenie Std.', c] = df_means.loc['Odchylenie Std.', c]
-                                df_str.loc['Baza (N)', c] = df_means.loc['Baza (N)', c]
-                            df_str.loc['Srednia'] = df_str.loc['Srednia'] + sig_df.loc['Srednia']
-                            df_means = df_str
-                        title = f"{row_var} x {col_var}"
-                        st.session_state.results['srednie'][title] = df_means
-                        with st.expander(title):
-                            st.dataframe(_format_means_table(df_means), use_container_width=True)
-                    except Exception as e:
-                        st.error(f"B\u0142\u0105d: {e}")
+        if _tracked_button("\u25b6\ufe0f Generuj tabele \u015brednich", "analyses", "means_table", type="primary") and mean_rows and mean_cols_sel:
+            _w_full = st.session_state.weights if use_weights else np.ones(len(df_raw))
+            for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
+                    df, df_raw, var_labels, st.session_state.split_var, weights=_w_full):
+                w = _w_s if _w_s is not None else np.ones(len(_df_raw_s))
+                for row_var in mean_rows:
+                    for col_var in mean_cols_sel:
+                        try:
+                            x = pd.to_numeric(_df_raw_s[row_var], errors='coerce')
+                            c_series = _df_s[col_var]
+                            cats = c_series.dropna().unique()
+                            df_means = pd.DataFrame(index=['Srednia', 'Odchylenie Std.', 'Baza (N)'], columns=cats)
+                            df_vars = pd.DataFrame(index=['Srednia'], columns=cats)
+                            df_ess = pd.DataFrame(index=['Srednia'], columns=cats)
+                            for cat in cats:
+                                mask = (c_series == cat).values
+                                mean, var, ess = get_weighted_stats(x[mask].values, w[mask])
+                                std = np.sqrt(var) if pd.notna(var) and var >= 0 else np.nan
+                                df_means.loc['Srednia', cat] = mean
+                                df_means.loc['Odchylenie Std.', cat] = std
+                                df_means.loc['Baza (N)', cat] = w[mask & ~np.isnan(x.values)].sum()
+                                df_vars.loc['Srednia', cat] = var
+                                df_ess.loc['Srednia', cat] = ess
+                            mean, var, ess = get_weighted_stats(x.values, w)
+                            df_means['Og\u00f3\u0142em'] = [mean, np.sqrt(var) if pd.notna(var) and var >= 0 else np.nan, w[~np.isnan(x.values)].sum()]
+                            df_vars['Og\u00f3\u0142em'] = var
+                            df_ess['Og\u00f3\u0142em'] = ess
+                            if do_means_sig:
+                                sig_df, col_letters = apply_means_sig_testing(df_means.loc[['Srednia']], df_vars.loc[['Srednia']], df_ess.loc[['Srednia']])
+                                rename_dict = {c: f"{c} [{col_letters.get(c, '')}]" for c in cats}
+                                df_means.rename(columns=rename_dict, inplace=True)
+                                sig_df.rename(columns=rename_dict, inplace=True)
+                                df_str = pd.DataFrame("", index=df_means.index, columns=df_means.columns)
+                                for c in df_means.columns:
+                                    df_str.loc['Srednia', c] = f"{df_means.loc['Srednia', c]:.2f}" if pd.notna(df_means.loc['Srednia', c]) else ""
+                                    df_str.loc['Odchylenie Std.', c] = df_means.loc['Odchylenie Std.', c]
+                                    df_str.loc['Baza (N)', c] = df_means.loc['Baza (N)', c]
+                                df_str.loc['Srednia'] = df_str.loc['Srednia'] + sig_df.loc['Srednia']
+                                df_means = df_str
+                            title_base = f"{row_var} x {col_var}"
+                            title = f"{title_base} | {_grp_lbl}" if _grp_lbl else title_base
+                            st.session_state.results['srednie'][title] = df_means
+                            with st.expander(title):
+                                st.dataframe(_format_means_table(df_means), use_container_width=True)
+                        except Exception as e:
+                            st.error(f"B\u0142\u0105d: {e}")
             st.success("\u2705 Tabele \u015brednich wygenerowane!")
 
         # Persistent display of means with delete
@@ -4584,15 +5499,17 @@ Pozwala sprawdzi\u0107 czy istnieje zwi\u0105zek mi\u0119dzy dwiema zmiennymi ka
                     st.session_state.results['srednie'] = {}
                     st.rerun()
             for title, df_means in list(st.session_state.results['srednie'].items()):
+                _base_m, _grp_m = _extract_split_from_title(title)
                 _mec1, _mec2 = st.columns([6, 1])
                 with _mec1:
-                    _mexp = st.expander(title, expanded=False)
+                    _mexp = st.expander(_base_m + (f" \u2014 \U0001f500 {_grp_m}" if _grp_m else ""), expanded=False)
                 with _mec2:
                     if st.button("\U0001f5d1\ufe0f", key=f"del_means_{title}",
                                  help=f"Usu\u0144 {title}"):
                         st.session_state.results['srednie'].pop(title, None)
                         st.rerun()
                 with _mexp:
+                    _split_badge(_grp_m)
                     st.dataframe(_format_means_table(df_means), use_container_width=True)
 
     with tab_desc:
@@ -4631,112 +5548,118 @@ Pozwala sprawdzi\u0107 czy istnieje zwi\u0105zek mi\u0119dzy dwiema zmiennymi ka
             d_n_valid  = st.checkbox("N wa\u017cnych",         value=True,  key="ds_nvalid")
             d_n_miss   = st.checkbox("N brak\u00f3w",          value=True,  key="ds_nmiss")
 
-        if st.button("\u25b6\ufe0f Generuj statystyki opisowe", type="primary") and desc_vars:
+        if _tracked_button("\u25b6\ufe0f Generuj statystyki opisowe", "analyses", "descriptive_stats", type="primary") and desc_vars:
             try:
-                _w_desc = (st.session_state.weights if use_weights and st.session_state.weights is not None
-                           else None)
+                _w_full_desc = (st.session_state.weights if use_weights and st.session_state.weights is not None
+                                else None)
 
-                def _wstat(col):
-                    """Return (values, weights) arrays after dropping NaN."""
-                    mask = df_raw[col].notna()
-                    x = df_raw.loc[mask, col].values.astype(float)
-                    if _w_desc is not None:
-                        w = pd.Series(_w_desc, index=df_raw.index).loc[mask].values.clip(min=0)
-                    else:
-                        w = np.ones(len(x))
-                    return x, w
+                for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
+                        df, df_raw, var_labels, st.session_state.split_var,
+                        weights=_w_full_desc):
 
-                def _wmean(x, w):
-                    return float((x * w).sum() / w.sum()) if w.sum() > 0 else np.nan
-
-                def _wvar(x, w):
-                    m = _wmean(x, w)
-                    n_eff = w.sum()
-                    return float((w * (x - m) ** 2).sum() / max(n_eff - 1, 1))
-
-                def _wquantile(x, w, q):
-                    """Weighted quantile (linear interpolation, consistent with SPSS)."""
-                    idx = np.argsort(x)
-                    xs, ws = x[idx], w[idx]
-                    cumw = np.cumsum(ws)
-                    total = cumw[-1]
-                    target = q * total
-                    # Find where cumulative weight crosses target
-                    i = np.searchsorted(cumw, target)
-                    if i == 0:
-                        return float(xs[0])
-                    if i >= len(xs):
-                        return float(xs[-1])
-                    # Linear interpolation
-                    frac = (target - cumw[i - 1]) / max(ws[i], 1e-12)
-                    return float(xs[i - 1] + frac * (xs[i] - xs[i - 1]))
-
-                rows = []
-                for c in desc_vars:
-                    x, w = _wstat(c)
-                    row = {'Zmienna': c, 'Etykieta': var_labels.get(c, c)}
-
-                    n_valid = int(df_raw[c].notna().sum())
-                    n_miss  = int(df_raw[c].isna().sum())
-                    n_w     = float(w.sum())   # effective weighted N
-
-                    if d_n_valid:  row['N wa\u017cnych (wa\u017cone)'] = int(round(n_w))
-                    if d_n_miss:   row['N brak\u00f3w']               = n_miss
-
-                    if d_mean:
-                        row['Srednia'] = _wmean(x, w)
-                    if d_trimmed:
-                        # Trimmed mean: use unweighted (SPSS behaviour)
-                        row['Srednia obci\u0119ta (5%)'] = float(stats.trim_mean(x, 0.05))
-                    if d_median:
-                        row['Mediana'] = _wquantile(x, w, 0.5)
-                    if d_mode:
-                        mode_res = stats.mode(x, keepdims=True)
-                        row['Dominanta'] = float(mode_res.mode[0]) if len(mode_res.mode) > 0 else np.nan
-                    if d_std:
-                        row['Odch. std.'] = float(np.sqrt(_wvar(x, w)))
-                    if d_var:
-                        row['Wariancja'] = _wvar(x, w)
-                    if d_se:
-                        row['B\u0142\u0105d std. (SE)'] = float(np.sqrt(_wvar(x, w) / max(n_w, 1)))
-                    if d_min:  row['Min'] = float(x.min())
-                    if d_max:  row['Max'] = float(x.max())
-                    if d_range: row['Rozst\u0119p'] = float(x.max() - x.min())
-                    if d_q1:   row['Q1 (25%)'] = _wquantile(x, w, 0.25)
-                    if d_q3:   row['Q3 (75%)'] = _wquantile(x, w, 0.75)
-                    if d_iqr:
-                        row['IQR'] = _wquantile(x, w, 0.75) - _wquantile(x, w, 0.25)
-                    if d_cv:
-                        mn = _wmean(x, w)
-                        std = np.sqrt(_wvar(x, w))
-                        row['CV (%)'] = float(std / mn * 100) if mn != 0 else np.nan
-                    if d_skew:
-                        # Weighted skewness (SPSS formula)
-                        mn  = _wmean(x, w)
-                        std = np.sqrt(_wvar(x, w))
-                        if std > 0:
-                            row['Sko\u015bno\u015b\u0107'] = float(
-                                (w * ((x - mn) / std) ** 3).sum() / w.sum())
+                    def _wstat(col):
+                        """Return (values, weights) arrays after dropping NaN (from slice)."""
+                        mask = _df_raw_s[col].notna()
+                        x = _df_raw_s.loc[mask, col].values.astype(float)
+                        if _w_s is not None:
+                            w = pd.Series(_w_s, index=_df_raw_s.index).loc[mask].values.clip(min=0)
                         else:
-                            row['Sko\u015bno\u015b\u0107'] = np.nan
-                    if d_kurt:
-                        mn  = _wmean(x, w)
-                        std = np.sqrt(_wvar(x, w))
-                        if std > 0:
-                            row['Kurtoza'] = float(
-                                (w * ((x - mn) / std) ** 4).sum() / w.sum() - 3)
-                        else:
-                            row['Kurtoza'] = np.nan
+                            w = np.ones(len(x))
+                        return x, w
 
-                    rows.append(row)
+                    def _wmean(x, w):
+                        return float((x * w).sum() / w.sum()) if w.sum() > 0 else np.nan
 
-                desc_df = pd.DataFrame(rows).set_index('Zmienna')
-                st.session_state.results['opisowe']['Statystyki opisowe'] = desc_df
-                num_cols_desc = [c for c in desc_df.columns if desc_df[c].dtype in [float, np.float64]]
-                st.dataframe(
-                    desc_df.style.format({c: '{:.3f}' for c in num_cols_desc}),
-                    use_container_width=True
-                )
+                    def _wvar(x, w):
+                        m = _wmean(x, w)
+                        n_eff = w.sum()
+                        return float((w * (x - m) ** 2).sum() / max(n_eff - 1, 1))
+
+                    def _wquantile(x, w, q):
+                        idx = np.argsort(x)
+                        xs, ws = x[idx], w[idx]
+                        cumw = np.cumsum(ws)
+                        total = cumw[-1]
+                        target = q * total
+                        i = np.searchsorted(cumw, target)
+                        if i == 0:
+                            return float(xs[0])
+                        if i >= len(xs):
+                            return float(xs[-1])
+                        frac = (target - cumw[i - 1]) / max(ws[i], 1e-12)
+                        return float(xs[i - 1] + frac * (xs[i] - xs[i - 1]))
+
+                    rows = []
+                    for c in desc_vars:
+                        x, w = _wstat(c)
+                        if len(x) == 0:
+                            continue
+                        row = {'Zmienna': c, 'Etykieta': var_labels.get(c, c)}
+
+                        n_valid = int(_df_raw_s[c].notna().sum())
+                        n_miss  = int(_df_raw_s[c].isna().sum())
+                        n_w     = float(w.sum())
+
+                        if d_n_valid:  row['N wa\u017cnych (wa\u017cone)'] = int(round(n_w))
+                        if d_n_miss:   row['N brak\u00f3w']               = n_miss
+
+                        if d_mean:
+                            row['Srednia'] = _wmean(x, w)
+                        if d_trimmed:
+                            row['Srednia obci\u0119ta (5%)'] = float(stats.trim_mean(x, 0.05))
+                        if d_median:
+                            row['Mediana'] = _wquantile(x, w, 0.5)
+                        if d_mode:
+                            mode_res = stats.mode(x, keepdims=True)
+                            row['Dominanta'] = float(mode_res.mode[0]) if len(mode_res.mode) > 0 else np.nan
+                        if d_std:
+                            row['Odch. std.'] = float(np.sqrt(_wvar(x, w)))
+                        if d_var:
+                            row['Wariancja'] = _wvar(x, w)
+                        if d_se:
+                            row['B\u0142\u0105d std. (SE)'] = float(np.sqrt(_wvar(x, w) / max(n_w, 1)))
+                        if d_min:  row['Min'] = float(x.min())
+                        if d_max:  row['Max'] = float(x.max())
+                        if d_range: row['Rozst\u0119p'] = float(x.max() - x.min())
+                        if d_q1:   row['Q1 (25%)'] = _wquantile(x, w, 0.25)
+                        if d_q3:   row['Q3 (75%)'] = _wquantile(x, w, 0.75)
+                        if d_iqr:
+                            row['IQR'] = _wquantile(x, w, 0.75) - _wquantile(x, w, 0.25)
+                        if d_cv:
+                            mn = _wmean(x, w)
+                            std = np.sqrt(_wvar(x, w))
+                            row['CV (%)'] = float(std / mn * 100) if mn != 0 else np.nan
+                        if d_skew:
+                            mn  = _wmean(x, w)
+                            std = np.sqrt(_wvar(x, w))
+                            if std > 0:
+                                row['Sko\u015bno\u015b\u0107'] = float(
+                                    (w * ((x - mn) / std) ** 3).sum() / w.sum())
+                            else:
+                                row['Sko\u015bno\u015b\u0107'] = np.nan
+                        if d_kurt:
+                            mn  = _wmean(x, w)
+                            std = np.sqrt(_wvar(x, w))
+                            if std > 0:
+                                row['Kurtoza'] = float(
+                                    (w * ((x - mn) / std) ** 4).sum() / w.sum() - 3)
+                            else:
+                                row['Kurtoza'] = np.nan
+
+                        rows.append(row)
+
+                    if not rows:
+                        continue
+                    desc_df = pd.DataFrame(rows).set_index('Zmienna')
+                    title_desc = f"Statystyki opisowe | {_grp_lbl}" if _grp_lbl else "Statystyki opisowe"
+                    st.session_state.results['opisowe'][title_desc] = desc_df
+                    num_cols_desc = [c for c in desc_df.columns if desc_df[c].dtype in [float, np.float64]]
+                    with st.expander(title_desc, expanded=True):
+                        _split_badge(_grp_lbl)
+                        st.dataframe(
+                            desc_df.style.format({c: '{:.3f}' for c in num_cols_desc}),
+                            use_container_width=True
+                        )
             except Exception as e:
                 st.error(str(e))
 
@@ -4758,94 +5681,92 @@ Pozwala sprawdzi\u0107 czy istnieje zwi\u0105zek mi\u0119dzy dwiema zmiennymi ka
                 help="Pary o warto\u015bci bezwzgl\u0119dnej korelacji \u2265 progu zostan\u0105 wyro\u017cnione kolorem i wy\u015bwietlone jako lista."
             )
 
-        if st.button("\u25b6\ufe0f Oblicz korelacje", type="primary") and len(corr_vars) > 1:
+        if _tracked_button("\u25b6\ufe0f Oblicz korelacje", "analyses", "correlations", type="primary") and len(corr_vars) > 1:
             try:
-                _w_corr = st.session_state.weights if use_weights else None
-                corr_df, n_obs = calculate_correlations(df_raw, corr_vars,
-                                                         weights=_w_corr,
-                                                         method=corr_method)
+                _w_full_corr = st.session_state.weights if use_weights else None
+                for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
+                        df, df_raw, var_labels, st.session_state.split_var,
+                        weights=_w_full_corr):
+                    corr_df, n_obs = calculate_correlations(_df_raw_s, corr_vars,
+                                                             weights=_w_s,
+                                                             method=corr_method)
 
-                # Raw numeric matrix (for styling and heatmap)
-                if corr_method == 'pearson' and _w_corr is not None:
-                    # Reconstruct numeric matrix from the starred corr_df
-                    import re as _re
-                    num_corr = corr_df.map(
-                        lambda x: float(_re.sub(r'[*\n].*', '', str(x))) if str(x) not in ('1.000', 'N/A') else (1.0 if str(x) == '1.000' else np.nan)
-                    )
-                else:
-                    num_corr = df_raw[corr_vars].corr(method=corr_method)
+                    # Raw numeric matrix (for styling and heatmap)
+                    if corr_method == 'pearson' and _w_s is not None:
+                        import re as _re
+                        num_corr = corr_df.map(
+                            lambda x: float(_re.sub(r'[*\n].*', '', str(x))) if str(x) not in ('1.000', 'N/A') else (1.0 if str(x) == '1.000' else np.nan)
+                        )
+                    else:
+                        num_corr = _df_raw_s[corr_vars].corr(method=corr_method)
 
-                corr_df.index   = [var_labels.get(c, c) for c in corr_df.index]
-                corr_df.columns = [var_labels.get(c, c) for c in corr_df.columns]
-                num_corr.index   = [var_labels.get(c, c) for c in num_corr.index]
-                num_corr.columns = [var_labels.get(c, c) for c in num_corr.columns]
+                    corr_df.index   = [var_labels.get(c, c) for c in corr_df.index]
+                    corr_df.columns = [var_labels.get(c, c) for c in corr_df.columns]
+                    num_corr.index   = [var_labels.get(c, c) for c in num_corr.index]
+                    num_corr.columns = [var_labels.get(c, c) for c in num_corr.columns]
 
-                st.session_state.results['korelacje']['Macierz Korelacji'] = corr_df
-                st.write(f"**Metoda:** {corr_method.title()} | **N wa\u017cnych obserwacji:** {int(round(float(n_obs)))}")
+                    title_corr = f"Macierz Korelacji | {_grp_lbl}" if _grp_lbl else "Macierz Korelacji"
+                    st.session_state.results['korelacje'][title_corr] = corr_df
+                    with st.expander(title_corr, expanded=True):
+                        _split_badge(_grp_lbl)
+                        st.write(f"**Metoda:** {corr_method.title()} | **N wa\u017cnych obserwacji:** {int(round(float(n_obs)))}")
 
-                # \u2500\u2500 Color-coded table \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-                _color_corr_cell = _make_color_corr_cell(corr_threshold)
+                        _color_corr_cell = _make_color_corr_cell(corr_threshold)
+                        styled = corr_df.style.map(_color_corr_cell).format(
+                            lambda x: x if isinstance(x, str) else f'{x:.3f}'
+                        )
+                        st.dataframe(styled, use_container_width=True)
 
-                styled = corr_df.style.map(_color_corr_cell).format(
-                    lambda x: x if isinstance(x, str) else f'{x:.3f}'
-                )
-                st.dataframe(styled, use_container_width=True)
+                        st.markdown(
+                            "\U0001f7e9 **Silna dodatnia** (r \u2265 0.70) &nbsp;&nbsp;"
+                            "\U0001f7e5 **Silna ujemna** (r \u2264 \u22120.70) &nbsp;&nbsp;"
+                            "\U0001f7e8 **Umiarkowana dodatnia / ujemna** (|r| \u2265 prog) &nbsp;&nbsp;"
+                            "\u25fb Poni\u017cej progu"
+                        )
 
-                # \u2500\u2500 Legend \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-                st.markdown(
-                    "\U0001f7e9 **Silna dodatnia** (r \u2265 0.70) &nbsp;&nbsp;"
-                    "\U0001f7e5 **Silna ujemna** (r \u2264 \u22120.70) &nbsp;&nbsp;"
-                    "\U0001f7e8 **Umiarkowana dodatnia / ujemna** (|r| \u2265 prog) &nbsp;&nbsp;"
-                    "\u25fb Poni\u017cej progu"
-                )
+                        strong_pairs = []
+                        cols_list = list(num_corr.columns)
+                        for i in range(len(cols_list)):
+                            for j in range(i + 1, len(cols_list)):
+                                r_val = float(num_corr.iloc[i, j])
+                                if abs(r_val) >= corr_threshold:
+                                    if abs(r_val) >= 0.7:
+                                        strength = "silna"
+                                    elif abs(r_val) >= 0.5:
+                                        strength = "umiarkowana"
+                                    else:
+                                        strength = "s\u0142aba"
+                                    direction = "dodatnia" if r_val > 0 else "ujemna"
+                                    strong_pairs.append({
+                                        "Zmienna A":    cols_list[i],
+                                        "Zmienna B":    cols_list[j],
+                                        "r":            round(r_val, 4),
+                                        "|r|":          round(abs(r_val), 4),
+                                        "Si\u0142a":    strength,
+                                        "Kierunek":     direction,
+                                    })
 
-                # \u2500\u2500 Strong pairs list \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-                strong_pairs = []
-                cols_list = list(num_corr.columns)
-                for i in range(len(cols_list)):
-                    for j in range(i + 1, len(cols_list)):
-                        r_val = float(num_corr.iloc[i, j])
-                        if abs(r_val) >= corr_threshold:
-                            if abs(r_val) >= 0.7:
-                                strength = "silna"
-                            elif abs(r_val) >= 0.5:
-                                strength = "umiarkowana"
-                            else:
-                                strength = "s\u0142aba"
-                            direction = "dodatnia" if r_val > 0 else "ujemna"
-                            strong_pairs.append({
-                                "Zmienna A":    cols_list[i],
-                                "Zmienna B":    cols_list[j],
-                                "r":            round(r_val, 4),
-                                "|r|":          round(abs(r_val), 4),
-                                "Si\u0142a":    strength,
-                                "Kierunek":     direction,
-                            })
+                        if strong_pairs:
+                            strong_df = pd.DataFrame(strong_pairs).sort_values("|r|", ascending=False)
+                            n_strong = len(strong_df)
+                            st.markdown(f"**\U0001f517 Silnie skorelowane pary (|r| \u2265 {corr_threshold:.2f}) \u2014 {n_strong} par:**")
+                            st.dataframe(
+                                strong_df.style.apply(_color_pair_row, axis=1)
+                                               .format({'r': '{:.4f}', '|r|': '{:.4f}'}),
+                                use_container_width=True, hide_index=True
+                            )
+                        else:
+                            st.info(f"Brak par o |r| \u2265 {corr_threshold:.2f}. Obni\u017c pr\u00f3g aby zobaczy\u0107 wi\u0119cej par.")
 
-                if strong_pairs:
-                    strong_df = pd.DataFrame(strong_pairs).sort_values("|r|", ascending=False)
-                    n_strong = len(strong_df)
-                    st.markdown(f"**\U0001f517 Silnie skorelowane pary (|r| \u2265 {corr_threshold:.2f}) \u2014 {n_strong} par:**")
-
-
-                    st.dataframe(
-                        strong_df.style.apply(_color_pair_row, axis=1)
-                                       .format({'r': '{:.4f}', '|r|': '{:.4f}'}),
-                        use_container_width=True, hide_index=True
-                    )
-                else:
-                    st.info(f"Brak par o |r| \u2265 {corr_threshold:.2f}. Obni\u017c pr\u00f3g aby zobaczy\u0107 wi\u0119cej par.")
-
-                # \u2500\u2500 Heatmap \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-                if show_heatmap:
-                    fig = px.imshow(
-                        num_corr, color_continuous_scale='RdBu_r',
-                        zmin=-1, zmax=1,
-                        title=f'Mapa ciep\u0142a korelacji ({corr_method.title()})',
-                        text_auto='.2f'
-                    )
-                    fig.update_layout(height=max(400, len(corr_vars) * 40 + 100))
-                    st.plotly_chart(fig, use_container_width=True, key=f"pc_corr_heatmap_{corr_method}")
+                        if show_heatmap:
+                            fig = px.imshow(
+                                num_corr, color_continuous_scale='RdBu_r',
+                                zmin=-1, zmax=1,
+                                title=f'Mapa ciep\u0142a korelacji ({corr_method.title()}) \u2014 {_grp_lbl}' if _grp_lbl else f'Mapa ciep\u0142a korelacji ({corr_method.title()})',
+                                text_auto='.2f'
+                            )
+                            fig.update_layout(height=max(400, len(corr_vars) * 40 + 100))
+                            st.plotly_chart(fig, use_container_width=True, key=f"pc_corr_heatmap_{corr_method}_{_grp_lbl or 'full'}")
 
             except Exception as e:
                 st.error(str(e))
@@ -4854,6 +5775,7 @@ Pozwala sprawdzi\u0107 czy istnieje zwi\u0105zek mi\u0119dzy dwiema zmiennymi ka
 # MODU? 4: REGRESJA
 # -------------------------------------------------------------
 elif menu == "\U0001f4c9 Regresja":
+    _require_module_access("regression")
     module_header("\U0001f4c9", "Regresja", "OLS (liniowa) i logistyczna (binarna/wielomianowa)")
     tab_ols, tab_log = st.tabs(["\U0001f4c9 OLS (liniowa)", "\U0001f4c9 Logistyczna"])
 
@@ -4918,19 +5840,23 @@ elif menu == "\U0001f4c9 Regresja":
             st.rerun()
 
         st.divider()
-        if st.button("\u25b6\ufe0f Uruchom regresj\u0119", type="primary"):
+        if _tracked_button("\u25b6\ufe0f Uruchom regresj\u0119", "regression", "run_ols", type="primary"):
             valid_blocks = [b for b in st.session_state.reg_blocks if b]
             if not valid_blocks:
                 st.error("Dodaj co najmniej jeden predyktor.")
             else:
                 with st.spinner("Obliczanie regresji OLS..."):
-                    _new_reg = run_regression_block(
-                        df_raw, dep_var, valid_blocks,
-                        weights=st.session_state.weights if use_weights else None
-                    )
-                    for _r in _new_reg:
-                        _merge_result(st.session_state.regression_results, _r,
-                            key_fn=lambda r: (r.get('dep_var',''), r.get('block_idx', 0)))
+                    _w_full = st.session_state.weights if use_weights else None
+                    for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
+                            df, df_raw, var_labels, st.session_state.split_var, weights=_w_full):
+                        _new_reg = run_regression_block(
+                            _df_raw_s, dep_var, valid_blocks, weights=_w_s
+                        )
+                        for _r in _new_reg:
+                            _r['group_label'] = _grp_lbl
+                            _merge_result(st.session_state.regression_results, _r,
+                                key_fn=lambda r: (r.get('dep_var',''), r.get('block_idx', 0),
+                                                  r.get('group_label', '')))
 
         if st.session_state.regression_results:
             _rgc1, _rgc2 = st.columns([5, 1])
@@ -4948,13 +5874,18 @@ elif menu == "\U0001f4c9 Regresja":
             dep_label = var_labels.get(res['dep_var'], res['dep_var'])
             _rc1, _rc2 = st.columns([6, 1])
             with _rc1:
-                _rexp = st.expander(f"\U0001f4ca Blok {res['Blok']} -- [{res['dep_var']}] {dep_label}", expanded=True)
+                _rexp = st.expander(
+                    f"\U0001f4ca Blok {res['Blok']} -- [{res['dep_var']}] {dep_label}"
+                    + (f" | {res.get('group_label','')}" if res.get('group_label') else ""),
+                    expanded=True
+                )
             with _rc2:
                 if st.button("\U0001f5d1\ufe0f", key=f"del_reg_{_ri}",
                              help=f"Usu\u0144 model {res['dep_var']}"):
                     st.session_state.regression_results.pop(_ri)
                     st.rerun()
             with _rexp:
+                _split_badge(res.get('group_label', ''))
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("N", f"{int(round(float(res['N']))):,}")
                 m2.metric("R\u00b2", f"{res['R2']:.4f}")
@@ -4996,7 +5927,8 @@ elif menu == "\U0001f4c9 Regresja":
                                            labels={'x': 'Wartosci dopasowane', 'y': 'Reszty'},
                                            title='Reszty vs Warto\u015bci dopasowane', color_discrete_sequence=['#2E75B6'])
                         fig_r.add_hline(y=0, line_dash='dash', line_color='red')
-                        st.plotly_chart(fig_r, use_container_width=True, key=f"pc_ols_{res.get('dep_var','ols')}_resid")
+                        _chart_key_base = f"{res.get('dep_var','ols')}_{res.get('Blok','')}_{res.get('group_label','')}_{_ri}"
+                        st.plotly_chart(fig_r, use_container_width=True, key=f"pc_ols_{_chart_key_base}_resid")
                     with ch2:
                         (osm, osr), (slope, intercept, _r) = stats.probplot(mod_d.resid)
                         fig_qq = go.Figure()
@@ -5005,7 +5937,7 @@ elif menu == "\U0001f4c9 Regresja":
                                                     mode='lines', name='Linia ref.', line=dict(color='red', dash='dash')))
                         fig_qq.update_layout(title='Wykres Q-Q (normalno\u015b\u0107 reszt)',
                                              xaxis_title='Kwantyle teoretyczne', yaxis_title='Kwantyle pr\u00f3bkowe')
-                        st.plotly_chart(fig_qq, use_container_width=True, key=f"pc_ols_{res.get('dep_var','ols')}_qq")
+                        st.plotly_chart(fig_qq, use_container_width=True, key=f"pc_ols_{_chart_key_base}_qq")
 
     # \u2500\u2500 TAB: Regresja Logistyczna \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     with tab_log:
@@ -5048,29 +5980,32 @@ Modeluje prawdopodobie\u0144stwo przynale\u017cno\u015bci do kategorii.
             log_dummy = st.checkbox("Automatycznie zakoduj zmienne kategoryczne (dummy coding)",
                                      value=True, key="log_dummy")
 
-        if st.button("\u25b6\ufe0f Uruchom regresj\u0119 logistyczn\u0105", type="primary", key="log_run"):
+        if _tracked_button("\u25b6\ufe0f Uruchom regresj\u0119 logistyczn\u0105", "regression", "run_logistic", type="primary", key="log_run"):
             if not log_indep:
                 st.error("Wybierz co najmniej jeden predyktor.")
             else:
                 with st.spinner("Obliczanie..."):
-                    try:
-                        df_lg = df[[log_dep] + log_indep].dropna().copy()
-                        n_obs = len(df_lg)
-                        # Weights for logistic
-                        _w_log = None
-                        if use_weights and st.session_state.weights is not None:
-                            _w_log = pd.Series(st.session_state.weights, index=df.index
-                                               ).reindex(df_lg.index).fillna(1).clip(lower=0).values
-                            n_obs = round(float(_w_log.sum()), 1)
-                        if len(df_lg) < 20:
-                            st.error(f"Za ma\u0142o obserwacji ({len(df_lg)}).")
-                        else:
+                    _w_full = st.session_state.weights if use_weights else None
+                    for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
+                            df, df_raw, var_labels, st.session_state.split_var, weights=_w_full):
+                        try:
+                            df_lg = _df_s[[log_dep] + log_indep].dropna().copy()
+                            n_obs = len(df_lg)
+                            _w_log = None
+                            if _w_s is not None:
+                                _w_log = pd.Series(_w_s, index=_df_s.index
+                                                   ).reindex(df_lg.index).fillna(1).clip(lower=0).values
+                                n_obs = round(float(_w_log.sum()), 1)
+                            if len(df_lg) < 20:
+                                _grp_disp = _grp_lbl or 'pe\u0142na baza'
+                                st.error(f"Za ma\u0142o obserwacji ({len(df_lg)}) dla grupy `{_grp_disp}`.")
+                                continue
                             y_series = df_lg[log_dep]
                             if log_type == "Binarna (Logit)":
                                 uniq = sorted(y_series.dropna().unique())
                                 if len(uniq) != 2:
-                                    st.error("Zmienna zale\u017cna musi mie\u0107 dok\u0142adnie 2 warto\u015bci.")
-                                    st.stop()
+                                    st.error(f"Zmienna zale\u017cna musi mie\u0107 dok\u0142adnie 2 warto\u015bci (grupa `{_grp_lbl}`).")
+                                    continue
                                 y = (y_series == uniq[1]).astype(np.float64)
                                 dep_ref = str(uniq[0]); dep_pos = str(uniq[1])
                             else:
@@ -5078,8 +6013,6 @@ Modeluje prawdopodobie\u0144stwo przynale\u017cno\u015bci do kategorii.
                                 dep_ref = str(sorted(y_series.unique())[0])
                                 dep_pos = "wszystkie"
 
-                            # \u2500\u2500 Build X matrix robustly \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-                            # Separate categorical (need dummies) from numeric
                             cat_cols = [c for c in log_indep
                                         if df_lg[c].dtype == object
                                         or (df_lg[c].nunique() <= 10 and log_dummy)]
@@ -5107,11 +6040,9 @@ Modeluje prawdopodobie\u0144stwo przynale\u017cno\u015bci do kategorii.
                                 X = pd.concat(parts, axis=1)
                             else:
                                 st.error("Brak predyktor\u00f3w do modelu.")
-                                st.stop()
+                                continue
 
-                            # Ensure all float64 \u2014 no object columns
                             X = X.astype(np.float64)
-                            # Keep as DataFrame so model.params has named index
                             X_const = sm.add_constant(X, has_constant='add').astype(np.float64)
                             y_fit = y.astype(np.float64)
 
@@ -5140,19 +6071,23 @@ Modeluje prawdopodobie\u0144stwo przynale\u017cno\u015bci do kategorii.
                                                 'dep_pos': dep_pos, 'indep_vars': log_indep, 'n_obs': n_obs,
                                                 'pseudo_r2': model.prsquared, 'llr_p': model.llr_pvalue,
                                                 'aic': model.aic, 'bic': model.bic, 'log_lik': model.llf,
-                                                'coef_df': coef_df, 'model': model, 'error': None}
+                                                'coef_df': coef_df, 'model': model, 'error': None,
+                                                'group_label': _grp_lbl}
                             else:
                                 model = sm.MNLogit(y_fit, X_const).fit(disp=False, maxiter=200)
                                 result_entry = {'type': 'Wielomianowa', 'dep_var': log_dep, 'dep_ref': dep_ref,
                                                 'indep_vars': log_indep, 'n_obs': n_obs,
                                                 'pseudo_r2': model.prsquared, 'llr_p': model.llr_pvalue,
                                                 'aic': model.aic, 'bic': model.bic, 'log_lik': model.llf,
-                                                'coef_df': None, 'model': model, 'error': None}
+                                                'coef_df': None, 'model': model, 'error': None,
+                                                'group_label': _grp_lbl}
                             _merge_result(st.session_state.logistic_results, result_entry,
-                                key_fn=lambda r: (r.get('dep_var',''), r.get('type','')))
-                            st.success("\u2705 Regresja logistyczna obliczona!")
-                    except Exception as _lg_err:
-                        st.error(f"B\u0142\u0105d: {_lg_err}")
+                                key_fn=lambda r: (r.get('dep_var',''), r.get('type',''),
+                                                  r.get('group_label','')))
+                        except Exception as _lg_err:
+                            _grp_disp = _grp_lbl or 'pe\u0142na baza'
+                            st.error(f"B\u0142\u0105d dla grupy `{_grp_disp}`: {_lg_err}")
+                    st.success("\u2705 Regresja logistyczna obliczona!")
 
         if st.session_state.logistic_results:
             _lgc1, _lgc2 = st.columns([5, 1])
@@ -5168,13 +6103,18 @@ Modeluje prawdopodobie\u0144stwo przynale\u017cno\u015bci do kategorii.
             dep_lbl = var_labels.get(res_lg['dep_var'], res_lg['dep_var'])
             _lgec1, _lgec2 = st.columns([6, 1])
             with _lgec1:
-                _lgexp = st.expander(f"\U0001f4c9 {res_lg['type']}: [{res_lg['dep_var']}] {dep_lbl}", expanded=True)
+                _lgexp = st.expander(
+                    f"\U0001f4c9 {res_lg['type']}: [{res_lg['dep_var']}] {dep_lbl}"
+                    + (f" | {res_lg.get('group_label','')}" if res_lg.get('group_label') else ""),
+                    expanded=True
+                )
             with _lgec2:
                 if st.button("\U0001f5d1\ufe0f", key=f"del_log_{_lgi}",
                              help=f"Usu\u0144 {res_lg['dep_var']}"):
                     st.session_state.logistic_results.pop(_lgi)
                     st.rerun()
             with _lgexp:
+                _split_badge(res_lg.get('group_label', ''))
                 m1,m2,m3,m4,m5 = st.columns(5)
                 m1.metric("N", f"{int(round(float(res_lg['n_obs']))):,}")
                 m2.metric("Pseudo R\u00b2", f"{res_lg['pseudo_r2']:.4f}")
@@ -5200,7 +6140,8 @@ Modeluje prawdopodobie\u0144stwo przynale\u017cno\u015bci do kategorii.
                         fig_or.add_vline(x=1, line_dash='dash', line_color='gray')
                         fig_or.update_layout(title='Ilorazy szans (OR) z 95% CI', xaxis_title='OR',
                                               height=max(300, len(plot_df)*35+100), showlegend=False)
-                        st.plotly_chart(fig_or, use_container_width=True, key=f"pc_log_{res_lg.get('dep_var','log')}_or")
+                        st.plotly_chart(fig_or, use_container_width=True,
+                                        key=f"pc_log_{res_lg.get('dep_var','log')}_{res_lg.get('group_label','')}_{_lgi}_or")
                 else:
                     st.text(res_lg['model'].summary().as_text())
 
@@ -5216,6 +6157,7 @@ Modeluje prawdopodobie\u0144stwo przynale\u017cno\u015bci do kategorii.
 # MODUL: TESTY NORMALNOSCI
 # =============================================================
 elif menu == "\U0001f4d0 Testy Normalno\u015bci":
+    _require_module_access("normality")
     module_header("\U0001f4d0", "Testy Normalno\u015bci",
                   "Sprawdzanie za\u0142o\u017cenia normalno\u015bci rozk\u0142adu \u2014 wymagane przed ANOVA, regresj\u0105 i innymi testami parametrycznymi")
 
@@ -5295,72 +6237,81 @@ za\u0142o\u017cenie wielu test\u00f3w parametrycznych: **t-testu, ANOVA, regresj
         norm_show_hist = st.checkbox("Histogram z krzywa normaln\u0105", value=True, key="norm_hist")
         norm_show_desc = st.checkbox("Statystyki opisowe (sko\u015bno\u015b\u0107, kurtoza)", value=True, key="norm_desc")
 
-    if st.button("\u25b6\ufe0f Przeprowad\u017a testy normalno\u015bci", type="primary",
-                 key="norm_run") and norm_vars and norm_tests:
-        for var in norm_vars:
-            _w_norm = st.session_state.weights if use_weights else None
-            if _w_norm is not None:
-                mask = df_raw[var].notna()
-                x_raw = df_raw.loc[mask, var].values.astype(float)
-                w_raw = pd.Series(_w_norm, index=df_raw.index).loc[mask].values
-                # Weighted sample via repetition (SPSS approach for normality tests)
-                reps = np.round(w_raw / w_raw.min()).astype(int)
-                x = np.repeat(x_raw, reps)
-            else:
-                x = df_raw[var].dropna().values.astype(float)
-
-            n = len(x)
-            n_raw = len(df_raw[var].dropna())
-
-            # \u2500\u2500 Normality tests \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-            test_rows = []
-            warn_msg = None
-            if "Shapiro-Wilk" in norm_tests:
-                if n > 5000:
-                    warn_msg = "Shapiro-Wilk: pr\u00f3ba zbyt du\u017ca (N > 5000). U\u017cyto losowej pr\u00f3bki 5000."
-                    x_sw = np.random.choice(x, 5000, replace=False)
+    if _tracked_button("\u25b6\ufe0f Przeprowad\u017a testy normalno\u015bci", "normality", "run_normality", type="primary",
+                       key="norm_run") and norm_vars and norm_tests:
+        _w_full_norm = st.session_state.weights if use_weights else None
+        for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
+                df, df_raw, var_labels, st.session_state.split_var, weights=_w_full_norm):
+            for var in norm_vars:
+                if _w_s is not None:
+                    mask = _df_raw_s[var].notna()
+                    x_raw = _df_raw_s.loc[mask, var].values.astype(float)
+                    w_raw = pd.Series(_w_s, index=_df_raw_s.index).loc[mask].values
+                    # Weighted sample via repetition (SPSS approach for normality tests)
+                    if len(w_raw) > 0 and w_raw.min() > 0:
+                        reps = np.round(w_raw / w_raw.min()).astype(int)
+                        x = np.repeat(x_raw, reps)
+                    else:
+                        x = x_raw
                 else:
-                    x_sw = x
-                sw_stat, sw_p = stats.shapiro(x_sw)
-                test_rows.append({
-                    "Test": "Shapiro-Wilk",
-                    "Statystyka": round(float(sw_stat), 4),
-                    "p-value": round(float(sw_p), 4),
-                    "Wynik": "\u2705 Normalny" if sw_p > norm_alpha else "\u274c Nienormalny"
-                })
+                    x = _df_raw_s[var].dropna().values.astype(float)
 
-            if "Kolmogorov-Smirnov (Lilliefors)" in norm_tests:
-                from statsmodels.stats.diagnostic import kstest_normal
-                lf_stat, lf_p = kstest_normal(x, dist='norm')
-                test_rows.append({
-                    "Test": "Lilliefors (K-S)",
-                    "Statystyka": round(float(lf_stat), 4),
-                    "p-value": round(float(lf_p), 4),
-                    "Wynik": "\u2705 Normalny" if lf_p > norm_alpha else "\u274c Nienormalny"
-                })
+                n = len(x)
+                n_raw = len(_df_raw_s[var].dropna())
+                if n < 3:
+                    _grp_disp = _grp_lbl or 'pe\u0142na baza'
+                    st.warning(f"Za ma\u0142o obserwacji dla `{var}` w grupie `{_grp_disp}` (N={n}).")
+                    continue
 
-            if "D\u2019Agostino-Pearson" in norm_tests:
-                dag_stat, dag_p = stats.normaltest(x)
-                test_rows.append({
-                    "Test": "D\u2019Agostino-Pearson",
-                    "Statystyka": round(float(dag_stat), 4),
-                    "p-value": round(float(dag_p), 4),
-                    "Wynik": "\u2705 Normalny" if dag_p > norm_alpha else "\u274c Nienormalny"
-                })
+                test_rows = []
+                warn_msg = None
+                if "Shapiro-Wilk" in norm_tests:
+                    if n > 5000:
+                        warn_msg = "Shapiro-Wilk: pr\u00f3ba zbyt du\u017ca (N > 5000). U\u017cyto losowej pr\u00f3bki 5000."
+                        x_sw = np.random.choice(x, 5000, replace=False)
+                    else:
+                        x_sw = x
+                    sw_stat, sw_p = stats.shapiro(x_sw)
+                    test_rows.append({
+                        "Test": "Shapiro-Wilk",
+                        "Statystyka": round(float(sw_stat), 4),
+                        "p-value": round(float(sw_p), 4),
+                        "Wynik": "\u2705 Normalny" if sw_p > norm_alpha else "\u274c Nienormalny"
+                    })
 
-            # Store result in session state
-            st.session_state.normality_results[var] = {
-                'var': var,
-                'x': x.tolist(),           # store as list (picklable for cache/project save)
-                'n': n,
-                'n_raw': n_raw,
-                'test_df': pd.DataFrame(test_rows),
-                'warn_msg': warn_msg,
-                'show_qq': bool(norm_show_qq),
-                'show_hist': bool(norm_show_hist),
-                'show_desc': bool(norm_show_desc),
-                'alpha': float(norm_alpha),
-            }
+                if "Kolmogorov-Smirnov (Lilliefors)" in norm_tests:
+                    from statsmodels.stats.diagnostic import kstest_normal
+                    lf_stat, lf_p = kstest_normal(x, dist='norm')
+                    test_rows.append({
+                        "Test": "Lilliefors (K-S)",
+                        "Statystyka": round(float(lf_stat), 4),
+                        "p-value": round(float(lf_p), 4),
+                        "Wynik": "\u2705 Normalny" if lf_p > norm_alpha else "\u274c Nienormalny"
+                    })
+
+                if "D\u2019Agostino-Pearson" in norm_tests:
+                    dag_stat, dag_p = stats.normaltest(x)
+                    test_rows.append({
+                        "Test": "D\u2019Agostino-Pearson",
+                        "Statystyka": round(float(dag_stat), 4),
+                        "p-value": round(float(dag_p), 4),
+                        "Wynik": "\u2705 Normalny" if dag_p > norm_alpha else "\u274c Nienormalny"
+                    })
+
+                result_key = f"{var} | {_grp_lbl}" if _grp_lbl else var
+                st.session_state.normality_results[result_key] = {
+                    'var': var,
+                    'group_label': _grp_lbl,
+                    'x': x.tolist(),
+                    'n': n,
+                    'n_raw': n_raw,
+                    'test_df': pd.DataFrame(test_rows),
+                    'warn_msg': warn_msg,
+                    'show_qq': bool(norm_show_qq),
+                    'show_hist': bool(norm_show_hist),
+                    'show_desc': bool(norm_show_desc),
+                    'alpha': float(norm_alpha),
+                }
 
     # \u2500\u2500 Display all stored results with delete UI \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     if st.session_state.normality_results:
@@ -5373,17 +6324,21 @@ za\u0142o\u017cenie wielu test\u00f3w parametrycznych: **t-testu, ANOVA, regresj
                 st.session_state.normality_results = {}
                 st.rerun()
 
-        for var, nres in list(st.session_state.normality_results.items()):
+        for result_key, nres in list(st.session_state.normality_results.items()):
+            var = nres.get('var', result_key)
             lbl = var_labels.get(var, var)
+            _grp_l = nres.get('group_label', '')
+            _title = f"\U0001f4ca {var} \u2014 {lbl}" + (f" | {_grp_l}" if _grp_l else "")
             _nec1, _nec2 = st.columns([6, 1])
             with _nec1:
-                _nexp = st.expander(f"\U0001f4ca {var} \u2014 {lbl}", expanded=True)
+                _nexp = st.expander(_title, expanded=True)
             with _nec2:
-                if st.button("\U0001f5d1\ufe0f", key=f"del_norm_{var}",
-                             help=f"Usu\u0144 test dla {var}"):
-                    st.session_state.normality_results.pop(var, None)
+                if st.button("\U0001f5d1\ufe0f", key=f"del_norm_{result_key}",
+                             help=f"Usu\u0144 {result_key}"):
+                    st.session_state.normality_results.pop(result_key, None)
                     st.rerun()
             with _nexp:
+                _split_badge(_grp_l)
                 x = np.array(nres['x'])
                 n = nres['n']
                 st.caption(f"N = {nres['n_raw']:,} obserwacji (efektywne N do test\u00f3w: {n:,})")
@@ -5438,7 +6393,7 @@ za\u0142o\u017cenie wielu test\u00f3w parametrycznych: **t-testu, ANOVA, regresj
                         height=350, showlegend=True
                     )
                     with plot_cols[plot_idx]:
-                        st.plotly_chart(fig_qq, use_container_width=True, key=f"qq_{var}")
+                        st.plotly_chart(fig_qq, use_container_width=True, key=f"qq_{result_key}")
                     plot_idx += 1
 
                 if nres.get('show_hist'):
@@ -5462,10 +6417,11 @@ za\u0142o\u017cenie wielu test\u00f3w parametrycznych: **t-testu, ANOVA, regresj
                         height=350, showlegend=True, barmode='overlay'
                     )
                     with plot_cols[plot_idx]:
-                        st.plotly_chart(fig_hist, use_container_width=True, key=f"hist_{var}")
+                        st.plotly_chart(fig_hist, use_container_width=True, key=f"hist_{result_key}")
 
 
 elif menu == "\U0001f4ca ANOVA":
+    _require_module_access("anova")
     module_header("\U0001f4ca", "ANOVA", "Jednoczynnikowa analiza wariancji z testem post-hoc Tukeya")
 
     with st.expander("\U0001f4d6 Jak wykona\u0107 i interpretowa\u0107 ANOVA -- kliknij aby rozwin\u0105\u0107", expanded=False):
@@ -5505,15 +6461,21 @@ p < 0.05 dla danej pary = ta para jest istotnie r\u00f3\u017cna.
     with col2:
         anova_grp = st.selectbox("\U0001f465 Czynnik grupuj\u0105cy (kategoryczna):", visible_columns, format_func=lambda x: get_var_display_name(x, var_labels))
 
-    if st.button("\u25b6\ufe0f Uruchom ANOVA", type="primary"):
+    if _tracked_button("\u25b6\ufe0f Uruchom ANOVA", "anova", "run_anova", type="primary"):
         with st.spinner("Obliczanie ANOVA..."):
-            result, err = run_anova(df_raw, anova_dep, anova_grp, df,
-                                      weights=st.session_state.weights if use_weights else None)
-            if err:
-                st.error(err)
-            else:
-                _merge_result(st.session_state.anova_results, result,
-                    key_fn=lambda r: (r.get('dep_var',''), r.get('group_var','')))
+            _w_full = st.session_state.weights if use_weights else None
+            for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
+                    df, df_raw, var_labels, st.session_state.split_var, weights=_w_full):
+                result, err = run_anova(_df_raw_s, anova_dep, anova_grp, _df_s,
+                                          weights=_w_s)
+                if err:
+                    _grp_disp = _grp_lbl or 'Pe\u0142na baza'
+                    st.error(f"{_grp_disp}: {err}")
+                else:
+                    result['group_label'] = _grp_lbl
+                    _merge_result(st.session_state.anova_results, result,
+                        key_fn=lambda r: (r.get('dep_var',''), r.get('group_var',''),
+                                          r.get('group_label', '')))
 
     if st.session_state.anova_results:
         _anc1, _anc2 = st.columns([5, 1])
@@ -5528,14 +6490,18 @@ p < 0.05 dla danej pary = ta para jest istotnie r\u00f3\u017cna.
         dep_l = var_labels.get(res['dep_var'], res['dep_var'])
         grp_l = var_labels.get(res['group_var'], res['group_var'])
         _ac1, _ac2 = st.columns([6, 1])
+        _title_anova = f"\U0001f4ca ANOVA: [{res['dep_var']}] {dep_l} \u00d7 [{res['group_var']}] {grp_l}"
+        if res.get('group_label'):
+            _title_anova += f" | {res['group_label']}"
         with _ac1:
-            _aexp = st.expander(f"\U0001f4ca ANOVA: [{res['dep_var']}] {dep_l} \u00d7 [{res['group_var']}] {grp_l}", expanded=True)
+            _aexp = st.expander(_title_anova, expanded=True)
         with _ac2:
             if st.button("\U0001f5d1\ufe0f", key=f"del_anova_{_ai}",
                          help=f"Usu\u0144 {res['dep_var']} x {res['group_var']}"):
                 st.session_state.anova_results.pop(_ai)
                 st.rerun()
         with _aexp:
+            _split_badge(res.get('group_label', ''))
             sig_label = "\u2705 Istotna statystycznie (p < 0.05)" if res['p'] < 0.05 else "\u274c Brak istotno\u015bci (p \u2265 0.05)"
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("F", f"{res['F']:.3f}")
@@ -5570,7 +6536,7 @@ p < 0.05 dla danej pary = ta para jest istotnie r\u00f3\u017cna.
                 marker_color='#2E75B6', name='\u015arednia \u00b1 Odch.std.'
             ))
             fig_anova.update_layout(title=f"\u015arednie wg grup -- {dep_l}", xaxis_title=grp_l, yaxis_title='Srednia', height=350)
-            st.plotly_chart(fig_anova, use_container_width=True, key=f"pc_anova_bar_{res['dep_var']}_{res['group_var']}")
+            st.plotly_chart(fig_anova, use_container_width=True, key=f"pc_anova_bar_{res['dep_var']}_{res['group_var']}_{res.get('group_label','')}")
 
             if not res['posthoc_df'].empty:
                 st.markdown("**Test post-hoc Tukey HSD:**")
@@ -5585,6 +6551,7 @@ p < 0.05 dla danej pary = ta para jest istotnie r\u00f3\u017cna.
 # MODU? 6: ANALIZA CZYNNIKOWA
 # -------------------------------------------------------------
 elif menu == "\U0001f52c Analiza Czynnikowa":
+    _require_module_access("factor")
     module_header("\U0001f52c", "Analiza Czynnikowa", "Eksploracyjna Analiza Czynnikowa (EFA)")
 
     with st.expander("\U0001f4d6 Jak wykona\u0107 i interpretowa\u0107 EFA -- kliknij aby rozwin\u0105\u0107", expanded=False):
@@ -5633,17 +6600,24 @@ Przyk\u0142ad: 15 pyta\u0144 o satysfakcj\u0119 mo\u017ce odzwierciedla\u0107 3 
 
         show_scree = st.checkbox("\U0001f4c8 Wykres osypiska (Scree Plot)")
 
-        if st.button("\u25b6\ufe0f Uruchom analiz\u0119 czynnikow\u0105", type="primary"):
+        if _tracked_button("\u25b6\ufe0f Uruchom analiz\u0119 czynnikow\u0105", "factor", "run_factor", type="primary"):
             with st.spinner("Obliczanie analizy czynnikowej..."):
-                result, err = run_factor_analysis(
-                    df_raw, fa_vars, int(n_factors), rotation, method,
-                    weights=st.session_state.weights if use_weights else None
-                )
-                if err:
-                    st.error(err)
-                else:
-                    _merge_result(st.session_state.factor_results, result,
-                        key_fn=lambda r: (tuple(sorted(r.get('variables',[]))), r.get('rotation','')))
+                _w_full = st.session_state.weights if use_weights else None
+                for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
+                        df, df_raw, var_labels, st.session_state.split_var, weights=_w_full):
+                    result, err = run_factor_analysis(
+                        _df_raw_s, fa_vars, int(n_factors), rotation, method,
+                        weights=_w_s
+                    )
+                    if err:
+                        _grp_disp = _grp_lbl or 'Pe\u0142na baza'
+                        st.error(f"{_grp_disp}: {err}")
+                    else:
+                        result['group_label'] = _grp_lbl
+                        _merge_result(st.session_state.factor_results, result,
+                            key_fn=lambda r: (tuple(sorted(r.get('variables',[]))),
+                                              r.get('rotation',''),
+                                              r.get('group_label', '')))
 
         if st.session_state.factor_results:
             _fcc1, _fcc2 = st.columns([5, 1])
@@ -5657,13 +6631,18 @@ Przyk\u0142ad: 15 pyta\u0144 o satysfakcj\u0119 mo\u017ce odzwierciedla\u0107 3 
         for _fi, res in enumerate(list(st.session_state.factor_results)):
             _fec1, _fec2 = st.columns([6, 1])
             with _fec1:
-                _fexp = st.expander(f"\U0001f52c Analiza czynnikowa -- {res['rotation'].upper()} -- N={res['n']}", expanded=True)
+                _fexp = st.expander(
+                    f"\U0001f52c Analiza czynnikowa -- {res['rotation'].upper()} -- N={res['n']}"
+                    + (f" | {res.get('group_label','')}" if res.get('group_label') else ""),
+                    expanded=True
+                )
             with _fec2:
                 if st.button("\U0001f5d1\ufe0f", key=f"del_factor_{_fi}",
                              help="Usu\u0144 analiz\u0119"):
                     st.session_state.factor_results.pop(_fi)
                     st.rerun()
             with _fexp:
+                _split_badge(res.get('group_label', ''))
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("N obserwacji", f"{int(round(float(res['n']))):,}")
                 m2.metric("KMO", f"{res['kmo']:.3f}", help="\u22650.7 = dobra adekwatnosc proby")
@@ -5715,6 +6694,7 @@ Przyk\u0142ad: 15 pyta\u0144 o satysfakcj\u0119 mo\u017ce odzwierciedla\u0107 3 
 # MODUL: CONJOINT
 # =============================================================
 elif menu == "\U0001f4ca Conjoint":
+    _require_module_access("conjoint")
     module_header("\U0001f4ca", "Analiza Conjoint", "Rating-based (OLS) i CBC (Logit) \u2014 u\u017cyteczno\u015bci cz\u0105stkowe i wa\u017cno\u015b\u0107 atrybut\u00f3w")
 
     with st.expander("\U0001f4d6 Jak wykona\u0107 i interpretowa\u0107 -- kliknij aby rozwin\u0105\u0107", expanded=False):
@@ -5769,20 +6749,26 @@ Conjoint (analiza l\u0105czna) mierzy, jak poszczeg\u00f3lne cechy produktu wp\u
         else:
             st.info("Wybierz zmienn\u0105 binarny\u0105 wyboru (1=wybrany profil) i zmienne atrybut\u00f3w. Dane musz\u0105 by\u0107 w formacie long.")
 
-    if st.button("\u25b6\ufe0f Uruchom analiz\u0119 Conjoint", type="primary"):
+    if _tracked_button("\u25b6\ufe0f Uruchom analiz\u0119 Conjoint", "conjoint", "run_conjoint", type="primary"):
         if not conj_attrs:
             st.error("Wybierz co najmniej jeden atrybut.")
         else:
             with st.spinner("Obliczanie..."):
-                if conj_method == "Rating-based (OLS)":
-                    res, err = run_conjoint_rating(df_raw, conj_rating, conj_attrs)
-                else:
-                    res, err = run_conjoint_cbc(df_raw, conj_choice, conj_attrs)
-            if err:
-                st.error(err)
-            else:
-                _merge_result(st.session_state.conjoint_results, res,
-                    key_fn=lambda r: (r.get('method',''), tuple(sorted(r.get('attribute_vars',[])))))
+                for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
+                        df, df_raw, var_labels, st.session_state.split_var, weights=None):
+                    if conj_method == "Rating-based (OLS)":
+                        res, err = run_conjoint_rating(_df_raw_s, conj_rating, conj_attrs)
+                    else:
+                        res, err = run_conjoint_cbc(_df_raw_s, conj_choice, conj_attrs)
+                    if err:
+                        _grp_disp = _grp_lbl or 'Pe\u0142na baza'
+                        st.error(f"{_grp_disp}: {err}")
+                    else:
+                        res['group_label'] = _grp_lbl
+                        _merge_result(st.session_state.conjoint_results, res,
+                            key_fn=lambda r: (r.get('method',''),
+                                              tuple(sorted(r.get('attribute_vars',[]))),
+                                              r.get('group_label', '')))
                 st.success("\u2705 Analiza Conjoint uko\u0144czona!")
 
     if st.session_state.conjoint_results:
@@ -5799,13 +6785,18 @@ Conjoint (analiza l\u0105czna) mierzy, jak poszczeg\u00f3lne cechy produktu wp\u
             st.error(res['error']); continue
         _cjec1, _cjec2 = st.columns([6, 1])
         with _cjec1:
-            _cjexp = st.expander(f"\U0001f4ca {res['method']} -- {len(res['attribute_vars'])} atrybut\u00f3w", expanded=True)
+            _cjexp = st.expander(
+                f"\U0001f4ca {res['method']} -- {len(res['attribute_vars'])} atrybut\u00f3w"
+                + (f" | {res.get('group_label','')}" if res.get('group_label') else ""),
+                expanded=True
+            )
         with _cjec2:
             if st.button("\U0001f5d1\ufe0f", key=f"del_conj_{_cji}",
                          help="Usu\u0144 analiz\u0119"):
                 st.session_state.conjoint_results.pop(_cji)
                 st.rerun()
         with _cjexp:
+            _split_badge(res.get('group_label', ''))
             # Summary metrics
             mc1, mc2, mc3, mc4 = st.columns(4)
             mc1.metric("N", f"{int(round(float(res['n']))):,}")
@@ -5877,6 +6868,7 @@ Conjoint (analiza l\u0105czna) mierzy, jak poszczeg\u00f3lne cechy produktu wp\u
 # MODUL: MAXDIFF
 # =============================================================
 elif menu == "\U0001f522 MaxDiff":
+    _require_module_access("maxdiff")
     module_header("\U0001f522", "MaxDiff", "Best-Worst Scaling \u2014 ranking wa\u017cno\u015bci element\u00f3w")
 
     with st.expander("\U0001f4d6 Jak wykona\u0107 i interpretowa\u0107 -- kliknij aby rozwin\u0105\u0107", expanded=False):
@@ -5979,24 +6971,28 @@ Przyk\u0142ad: `Zestaw1_Best`, `Zestaw1_Worst`, `Zestaw2_Best`, `Zestaw2_Worst`,
     st.markdown("##### 3. Nazwa analizy i uruchomienie")
     md_name = st.text_input("Nazwa analizy MaxDiff:", value="MaxDiff", key="md_name")
 
-    if st.button("\u25b6\ufe0f Uruchom analiz\u0119 MaxDiff", type="primary"):
+    if _tracked_button("\u25b6\ufe0f Uruchom analiz\u0119 MaxDiff", "maxdiff", "run_maxdiff", type="primary"):
         if not valid_pairs:
             st.error("Wybierz co najmniej jedn\u0105 par\u0119 kolumn Best/Worst.")
         elif len(md_items) < 2:
             st.error("Podaj co najmniej 2 pozycje.")
         else:
             with st.spinner("Obliczanie wynik\u00f3w MaxDiff..."):
-                df_scores = run_maxdiff(df_raw, valid_pairs, md_items)
-            result_md = {
-                'name': md_name,
-                'pairs': valid_pairs,
-                'items': md_items,
-                'n_resp': len(df_raw),
-                'n_tasks': len(valid_pairs),
-                'scores': df_scores,
-            }
-            _merge_result(st.session_state.maxdiff_results, result_md,
-                key_fn=lambda r: r.get('name',''))
+                for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
+                        df, df_raw, var_labels, st.session_state.split_var, weights=None):
+                    df_scores = run_maxdiff(_df_raw_s, valid_pairs, md_items)
+                    name_eff = f"{md_name} | {_grp_lbl}" if _grp_lbl else md_name
+                    result_md = {
+                        'name': name_eff,
+                        'group_label': _grp_lbl,
+                        'pairs': valid_pairs,
+                        'items': md_items,
+                        'n_resp': len(_df_raw_s),
+                        'n_tasks': len(valid_pairs),
+                        'scores': df_scores,
+                    }
+                    _merge_result(st.session_state.maxdiff_results, result_md,
+                        key_fn=lambda r: r.get('name',''))
             st.success(f"\u2705 MaxDiff uko\u0144czony! Przeanalizowano {len(valid_pairs)} zestaw\u00f3w, {len(md_items)} pozycji.")
 
     if st.session_state.maxdiff_results:
@@ -6009,15 +7005,21 @@ Przyk\u0142ad: `Zestaw1_Best`, `Zestaw1_Worst`, `Zestaw2_Best`, `Zestaw2_Worst`,
                 st.rerun()
 
     for _mdi, res in enumerate(list(st.session_state.maxdiff_results)):
+        _base_md, _grp_md = _extract_split_from_title(res['name'])
         _mdec1, _mdec2 = st.columns([6, 1])
         with _mdec1:
-            _mdexp = st.expander(f"\U0001f522 {res['name']} -- {res['n_tasks']} zestaw\u00f3w, {len(res['items'])} pozycji", expanded=True)
+            _mdexp = st.expander(
+                f"\U0001f522 {_base_md} -- {res['n_tasks']} zestaw\u00f3w, {len(res['items'])} pozycji"
+                + (f" \u2014 \U0001f500 {_grp_md}" if _grp_md else ""),
+                expanded=True
+            )
         with _mdec2:
             if st.button("\U0001f5d1\ufe0f", key=f"del_md_{_mdi}",
                          help=f"Usu\u0144 {res['name']}"):
                 st.session_state.maxdiff_results.pop(_mdi)
                 st.rerun()
         with _mdexp:
+            _split_badge(_grp_md)
             df_s = res['scores']
             mc1, mc2, mc3 = st.columns(3)
             mc1.metric("N respondent\u00f3w", f"{int(round(float(res['n_resp']))):,}")
@@ -6062,6 +7064,7 @@ Przyk\u0142ad: `Zestaw1_Best`, `Zestaw1_Worst`, `Zestaw2_Best`, `Zestaw2_Worst`,
 # MODUL: SKUPIENIA HIERARCHICZNE
 # =============================================================
 elif menu == "\U0001f3af Skupienia i Segmentacja":
+    _require_module_access("cluster")
     module_header("\U0001f3af", "Skupienia i Segmentacja", "Skupienia hierarchiczne (dendrogram) i segmentacja K-Means")
     tab_hc, tab_kmeans = st.tabs(["\U0001f333 Skupienia Hierarchiczne", "\U0001f3af Segmentacja K-Means"])
 
@@ -6134,7 +7137,7 @@ elif menu == "\U0001f3af Skupienia i Segmentacja":
                     "Zmie\u0144 nazw\u0119, je\u015bli chcesz zachowa\u0107 obydwa wyniki."
                 )
 
-        if st.button("\u25b6\ufe0f Generuj dendrogram i skupienia", type="primary", key="hc_run"):
+        if _tracked_button("\u25b6\ufe0f Generuj dendrogram i skupienia", "cluster", "run_hclust", type="primary", key="hc_run"):
             if len(hc_vars) < 2:
                 st.error("Wybierz co najmniej 2 zmienne.")
             else:
@@ -6143,99 +7146,118 @@ elif menu == "\U0001f3af Skupienia i Segmentacja":
                 matplotlib.use('Agg')
                 import matplotlib.pyplot as plt
 
-                df_hc = df_raw[hc_vars].dropna()
-                n_used = min(len(df_hc), int(hc_max_obs))
-                if len(df_hc) > n_used:
-                    df_hc = df_hc.sample(n=n_used, random_state=42)
-                    st.info(f"Losowa pr\u00f3bka: {n_used} z {len(df_raw[hc_vars].dropna())} kompletnych obserwacji.")
+                for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
+                        df, df_raw, var_labels, st.session_state.split_var, weights=None):
+                    # Per-group variable name suffix to avoid collisions between groups
+                    grp_suffix = ""
+                    if _grp_lbl:
+                        _safe = _grp_lbl.replace('=', '_').replace(' ', '_')
+                        grp_suffix = f"_{_safe}"
+                    hc_var_name_eff = f"{hc_var_name}{grp_suffix}"
 
-                if hc_standardize:
-                    from sklearn.preprocessing import StandardScaler
-                    X = StandardScaler().fit_transform(df_hc.values)
-                else:
-                    X = df_hc.values
+                    df_hc = _df_raw_s[hc_vars].dropna()
+                    if len(df_hc) < 3:
+                        _grp_disp = _grp_lbl or 'pe\u0142na baza'
+                        st.warning(f"Za ma\u0142o obserwacji dla grupy `{_grp_disp}` (N={len(df_hc)}).")
+                        continue
+                    n_used = min(len(df_hc), int(hc_max_obs))
+                    if len(df_hc) > n_used:
+                        df_hc = df_hc.sample(n=n_used, random_state=42)
+                        _grp_disp = _grp_lbl or 'Pe\u0142na baza'
+                        st.info(f"[{_grp_disp}] Losowa pr\u00f3bka: {n_used} z {len(_df_raw_s[hc_vars].dropna())} kompletnych obserwacji.")
 
-                with st.spinner("Obliczanie skupie\u0144..."):
-                    Z = linkage(X, method=hc_method,
-                                metric=hc_metric if hc_method != 'ward' else 'euclidean')
+                    if hc_standardize:
+                        from sklearn.preprocessing import StandardScaler
+                        X = StandardScaler().fit_transform(df_hc.values)
+                    else:
+                        X = df_hc.values
 
-                # \u2500\u2500 Dendrogram \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-                fig_dend, ax = plt.subplots(figsize=(14, 5))
-                dendrogram(
-                    Z, ax=ax,
-                    truncate_mode='lastp', p=50,
-                    leaf_rotation=90, leaf_font_size=8,
-                    color_threshold=0.7 * max(Z[:, 2]),
-                    above_threshold_color='#888888',
-                )
-                ax.set_title(f"Dendrogram skupie\u0144 hierarchicznych ({hc_method.title()}, n={n_used})",
-                             fontsize=12, fontweight='bold')
-                ax.set_xlabel("Indeks obserwacji lub liczba skupionych obiekt\u00f3w")
-                ax.set_ylabel("Odleg\u0142o\u015b\u0107")
-                ax.axhline(y=Z[-int(hc_n_clusters)+1, 2], color='#C00000',
-                           linestyle='--', linewidth=1.5,
-                           label=f"Ci\u0119cie: {hc_n_clusters} skupie\u0144")
-                ax.legend(fontsize=9)
-                plt.tight_layout()
-                st.pyplot(fig_dend, use_container_width=True)
+                    _grp_disp_sp = _grp_lbl or 'pe\u0142na baza'
+                    with st.spinner(f"Obliczanie skupie\u0144 dla `{_grp_disp_sp}`..."):
+                        Z = linkage(X, method=hc_method,
+                                    metric=hc_metric if hc_method != 'ward' else 'euclidean')
 
-                # Download dendrogram
-                buf_d = io.BytesIO()
-                fig_dend.savefig(buf_d, format='png', dpi=150, bbox_inches='tight')
-                buf_d.seek(0)
-                plt.close(fig_dend)
-                st.download_button(
-                    "\u2b07\ufe0f Pobierz dendrogram (PNG)",
-                    data=buf_d.getvalue(),
-                    file_name=f"dendrogram_{hc_method}.png",
-                    mime="image/png"
-                )
+                    # Dendrogram
+                    fig_dend, ax = plt.subplots(figsize=(14, 5))
+                    dendrogram(
+                        Z, ax=ax,
+                        truncate_mode='lastp', p=50,
+                        leaf_rotation=90, leaf_font_size=8,
+                        color_threshold=0.7 * max(Z[:, 2]),
+                        above_threshold_color='#888888',
+                    )
+                    _title_d = f"Dendrogram skupie\u0144 hierarchicznych ({hc_method.title()}, n={n_used})"
+                    if _grp_lbl:
+                        _title_d += f" \u2014 {_grp_lbl}"
+                    ax.set_title(_title_d, fontsize=12, fontweight='bold')
+                    ax.set_xlabel("Indeks obserwacji lub liczba skupionych obiekt\u00f3w")
+                    ax.set_ylabel("Odleg\u0142o\u015b\u0107")
+                    ax.axhline(y=Z[-int(hc_n_clusters)+1, 2], color='#C00000',
+                               linestyle='--', linewidth=1.5,
+                               label=f"Ci\u0119cie: {hc_n_clusters} skupie\u0144")
+                    ax.legend(fontsize=9)
+                    plt.tight_layout()
+                    st.pyplot(fig_dend, use_container_width=True)
 
-                # \u2500\u2500 Assign clusters to full dataset \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-                if hc_standardize:
-                    X_full = StandardScaler().fit_transform(df_raw[hc_vars].dropna().values)
-                else:
-                    X_full = df_raw[hc_vars].dropna().values
+                    buf_d = io.BytesIO()
+                    fig_dend.savefig(buf_d, format='png', dpi=150, bbox_inches='tight')
+                    buf_d.seek(0)
+                    plt.close(fig_dend)
+                    st.download_button(
+                        f"\u2b07\ufe0f Pobierz dendrogram (PNG)" + (f" \u2014 {_grp_lbl}" if _grp_lbl else ""),
+                        data=buf_d.getvalue(),
+                        file_name=f"dendrogram_{hc_method}{grp_suffix}.png",
+                        mime="image/png",
+                        key=f"hc_dl_{hc_var_name_eff}"
+                    )
 
-                Z_full = linkage(X_full, method=hc_method,
-                                 metric=hc_metric if hc_method != 'ward' else 'euclidean')
-                labels_full = fcluster(Z_full, hc_n_clusters, criterion='maxclust')
+                    # Assign clusters to full dataset (of this group slice)
+                    if hc_standardize:
+                        X_full = StandardScaler().fit_transform(_df_raw_s[hc_vars].dropna().values)
+                    else:
+                        X_full = _df_raw_s[hc_vars].dropna().values
 
-                idx_full = df_raw[hc_vars].dropna().index
-                df_raw.loc[idx_full, hc_var_name] = labels_full
-                df.loc[idx_full,     hc_var_name] = [f"Skupienie {c}" for c in labels_full]
-                var_labels[hc_var_name] = f"Skupienia hierarchiczne ({hc_n_clusters} grup, {hc_method})"
+                    Z_full = linkage(X_full, method=hc_method,
+                                     metric=hc_metric if hc_method != 'ward' else 'euclidean')
+                    labels_full = fcluster(Z_full, hc_n_clusters, criterion='maxclust')
 
-                # \u2500\u2500 Cluster sizes \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-                sizes = pd.Series(labels_full).value_counts().sort_index()
-                sizes_df = pd.DataFrame({
-                    "Skupienie": [f"Skupienie {i}" for i in sizes.index],
-                    "N": sizes.values,
-                    "%": (sizes.values / sizes.sum() * 100).round(1),
-                })
+                    idx_full = _df_raw_s[hc_vars].dropna().index
+                    df_raw.loc[idx_full, hc_var_name_eff] = labels_full
+                    df.loc[idx_full,     hc_var_name_eff] = [f"Skupienie {c}" for c in labels_full]
+                    var_labels[hc_var_name_eff] = f"Skupienia hierarchiczne ({hc_n_clusters} grup, {hc_method})" + (f" [{_grp_lbl}]" if _grp_lbl else "")
 
-                # Profile: cluster means per variable
-                profile_df = df_raw.loc[idx_full, hc_vars + [hc_var_name]].copy()
-                profile_df[hc_var_name] = profile_df[hc_var_name].astype(int)
-                cluster_means = profile_df.groupby(hc_var_name)[hc_vars].mean().round(2)
-                cluster_means.index = [f"Skupienie {i}" for i in cluster_means.index]
+                    # Cluster sizes
+                    sizes = pd.Series(labels_full).value_counts().sort_index()
+                    sizes_df = pd.DataFrame({
+                        "Skupienie": [f"Skupienie {i}" for i in sizes.index],
+                        "N": sizes.values,
+                        "%": (sizes.values / sizes.sum() * 100).round(1),
+                    })
 
-                result_entry = {
-                    'method': hc_method,
-                    'metric': hc_metric,
-                    'n_clusters': int(hc_n_clusters),
-                    'vars': hc_vars,
-                    'var_name': hc_var_name,
-                    'n_obs': len(idx_full),
-                    'sizes': sizes_df,
-                    'profile': cluster_means,
-                    'Z': Z_full.tolist(),
-                    'standardize': hc_standardize,
-                    'labels_data': {str(i): int(lbl) for i, lbl in zip(idx_full, labels_full)},
-                }
-                _merge_result(st.session_state.hclust_results, result_entry,
-                    key_fn=lambda r: r.get('var_name',''))
-                st.success(f"\u2705 Skupienia hierarchiczne obliczone! Zmienna `{hc_var_name}` dodana do bazy.")
+                    # Profile
+                    profile_df = _df_raw_s.loc[idx_full, hc_vars + [hc_var_name_eff]].copy()
+                    profile_df[hc_var_name_eff] = profile_df[hc_var_name_eff].astype(int)
+                    cluster_means = profile_df.groupby(hc_var_name_eff)[hc_vars].mean().round(2)
+                    cluster_means.index = [f"Skupienie {i}" for i in cluster_means.index]
+
+                    result_entry = {
+                        'method': hc_method,
+                        'metric': hc_metric,
+                        'n_clusters': int(hc_n_clusters),
+                        'vars': hc_vars,
+                        'var_name': hc_var_name_eff,
+                        'group_label': _grp_lbl,
+                        'n_obs': len(idx_full),
+                        'sizes': sizes_df,
+                        'profile': cluster_means,
+                        'Z': Z_full.tolist(),
+                        'standardize': hc_standardize,
+                        'labels_data': {str(i): int(lbl) for i, lbl in zip(idx_full, labels_full)},
+                    }
+                    _merge_result(st.session_state.hclust_results, result_entry,
+                        key_fn=lambda r: r.get('var_name',''))
+                    _grp_disp = _grp_lbl or 'Pe\u0142na baza'
+                    st.success(f"\u2705 [{_grp_disp}] Zmienna `{hc_var_name_eff}` dodana do bazy.")
 
         if st.session_state.hclust_results:
             _hcc1, _hcc2 = st.columns([5, 1])
@@ -6259,6 +7281,7 @@ elif menu == "\U0001f3af Skupienia i Segmentacja":
                     st.session_state.hclust_results.pop(_hci)
                     st.rerun()
             with _hcexp:
+                _split_badge(res_hc.get('group_label', ''))
                 sc1, sc2, sc3 = st.columns(3)
                 sc1.metric("N obserwacji", f"{int(round(float(res_hc['n_obs']))):,}")
                 sc2.metric("Skupie\u0144", res_hc['n_clusters'])
@@ -6294,7 +7317,7 @@ elif menu == "\U0001f3af Skupienia i Segmentacja":
         seg_name = st.text_input("Nazwa zmiennej segmentacyjnej:",
                                   value=f"Segmentacja_{len(st.session_state.segmentations) + 1}",
                                   key="seg_name_mod")
-        if st.button("\u25b6\ufe0f Wykonaj segmentacj\u0119 K-Means", type="primary", key="seg_run_mod"):
+        if _tracked_button("\u25b6\ufe0f Wykonaj segmentacj\u0119 K-Means", "cluster", "run_kmeans", type="primary", key="seg_run_mod"):
             if len(seg_vars) < 2:
                 st.error("Wybierz co najmniej 2 zmienne.")
             else:
@@ -6340,6 +7363,7 @@ elif menu == "\U0001f3af Skupienia i Segmentacja":
 
 
 elif menu == "\u2601\ufe0f Chmura S\u0142\u00f3w":
+    _require_module_access("wordcloud")
     module_header("\u2601\ufe0f", "Chmura S\u0142\u00f3w", "Wizualizacja odpowiedzi otwartych \u2014 eksport PNG/JPG")
 
     # Check for wordcloud availability
@@ -6460,50 +7484,49 @@ elif menu == "\u2601\ufe0f Chmura S\u0142\u00f3w":
 
             st.divider()
 
-            if st.button("\u25b6\ufe0f Generuj chmur\u0119 s\u0142\u00f3w", type="primary",
-                         use_container_width=True, key="wc_generate"):
+            if _tracked_button("\u25b6\ufe0f Generuj chmur\u0119 s\u0142\u00f3w", "wordcloud", "generate_wordcloud", type="primary",
+                               use_container_width=True, key="wc_generate"):
 
-                # Build text corpus \u2014 use value labels for SPSS coded variables
-                raw_series = df_raw[wc_var].dropna()
+                for _grp_lbl, _df_s, _df_raw_s, _w_s in _iter_split_groups(
+                        df, df_raw, var_labels, st.session_state.split_var, weights=None):
+                    if _grp_lbl:
+                        st.markdown(f"### \U0001f4cc {_grp_lbl}")
 
-                if is_spss:
-                    # Check if this variable has value labels (coded numeric/categorical)
-                    spss_val_labels = {}
-                    spss_val_labels.update(meta_orig.variable_value_labels.get(wc_var, {}))
-                    spss_val_labels.update(st.session_state.custom_val_labels.get(wc_var, {}))
+                    # Build text corpus \u2014 use value labels for SPSS coded variables
+                    raw_series = _df_raw_s[wc_var].dropna()
 
-                    if spss_val_labels:
-                        # Map each code to its label; fall back to str(code) if no label
-                        def _map_label(v):
-                            # SPSS codes may be float (1.0) or int
-                            lbl = (spss_val_labels.get(v)
-                                   or spss_val_labels.get(int(v) if isinstance(v, float) and v == int(v) else v)
-                                   or spss_val_labels.get(str(int(v)) if isinstance(v, float) and v == int(v) else str(v))
-                                   or str(v))
-                            return str(lbl)
-                        texts = raw_series.map(_map_label).tolist()
+                    if is_spss:
+                        spss_val_labels = {}
+                        spss_val_labels.update(meta_orig.variable_value_labels.get(wc_var, {}))
+                        spss_val_labels.update(st.session_state.custom_val_labels.get(wc_var, {}))
+
+                        if spss_val_labels:
+                            def _map_label(v):
+                                lbl = (spss_val_labels.get(v)
+                                       or spss_val_labels.get(int(v) if isinstance(v, float) and v == int(v) else v)
+                                       or spss_val_labels.get(str(int(v)) if isinstance(v, float) and v == int(v) else str(v))
+                                       or str(v))
+                                return str(lbl)
+                            texts = raw_series.map(_map_label).tolist()
+                        else:
+                            texts = raw_series.astype(str).tolist()
                     else:
-                        # Open-ended text variable \u2014 use as-is
                         texts = raw_series.astype(str).tolist()
-                else:
-                    texts = raw_series.astype(str).tolist()
 
-                corpus = " ".join(texts)
+                    corpus = " ".join(texts)
+                    if wc_lowercase:
+                        corpus = corpus.lower()
 
-                if wc_lowercase:
-                    corpus = corpus.lower()
+                    raw_sw = stopwords_raw.replace(',', ' ').split()
+                    stop_set = {w.strip().lower() for w in raw_sw if w.strip()}
 
-                # Build stop words set
-                raw_sw = stopwords_raw.replace(',', ' ').split()
-                stop_set = {w.strip().lower() for w in raw_sw if w.strip()}
+                    if not corpus.strip():
+                        st.warning(f"Brak tekstu do analizy{' dla grupy ' + _grp_lbl if _grp_lbl else ''}.")
+                        continue
 
-                if not corpus.strip():
-                    st.error("Wybrana zmienna jest pusta \u2014 brak tekstu do analizy.")
-                else:
                     try:
                         import matplotlib.cm as cm
 
-                        # \u2500\u2500 1. Tokenize corpus \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
                         token_re = re.compile(
                             r"[\w\u0104\u0105\u0106\u0107\u0118\u0119"
                             r"\u0141\u0142\u0143\u0144\u00d3\u00f3"
@@ -6512,7 +7535,6 @@ elif menu == "\u2601\ufe0f Chmura S\u0142\u00f3w":
                         )
                         tokens = token_re.findall(corpus)
 
-                        # \u2500\u2500 2. Count frequencies (excluding stop words) \u2500
                         freq = {}
                         for tok in tokens:
                             w = tok.lower() if wc_lowercase else tok
@@ -6522,87 +7544,145 @@ elif menu == "\u2601\ufe0f Chmura S\u0142\u00f3w":
                                 continue
                             freq[w] = freq.get(w, 0) + 1
 
-                        # \u2500\u2500 3. Apply minimum frequency filter \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
                         if wc_min_freq > 1:
                             freq = {w: c for w, c in freq.items()
                                     if c >= int(wc_min_freq)}
 
                         if not freq:
                             st.warning(
-                                "Po zastosowaniu filtr\u00f3w nie pozosta\u0142o \u017cadne s\u0142owo. "
-                                "Spr\u00f3buj zmniejszy\u0107 minimaln\u0105 cz\u0119sto\u015b\u0107 lub "
-                                "skr\u00f3ci\u0107 list\u0119 stop words."
+                                "Po zastosowaniu filtr\u00f3w nie pozosta\u0142o \u017cadne s\u0142owo"
+                                + (f" dla grupy `{_grp_lbl}`" if _grp_lbl else "")
+                                + ". Spr\u00f3buj zmniejszy\u0107 minimaln\u0105 cz\u0119sto\u015b\u0107 lub "
+                                  "skr\u00f3ci\u0107 list\u0119 stop words."
                             )
-                        else:
-                            # \u2500\u2500 4. Build WordCloud from frequency dict \u2500\u2500
-                            wc_obj = WordCloud(
-                                width=int(wc_width),
-                                height=int(wc_height),
-                                background_color=wc_bg,
-                                colormap=wc_palette,
-                                max_words=int(wc_max_words),
-                                min_font_size=8,
-                                max_font_size=None,
-                                min_word_length=2,
-                                collocations=False,  # already filtered
-                                relative_scaling=0.5,
-                                prefer_horizontal=0.9,
-                            ).generate_from_frequencies(freq)
+                            continue
 
-                            # \u2500\u2500 5. Render with matplotlib \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-                            fig, ax = plt.subplots(
-                                figsize=(int(wc_width) / 100, int(wc_height) / 100),
-                                dpi=100
-                            )
-                            ax.imshow(wc_obj, interpolation='bilinear')
-                            ax.axis('off')
-                            fig.patch.set_facecolor(wc_bg)
-                            plt.tight_layout(pad=0)
+                        wc_obj = WordCloud(
+                            width=int(wc_width),
+                            height=int(wc_height),
+                            background_color=wc_bg,
+                            colormap=wc_palette,
+                            max_words=int(wc_max_words),
+                            min_font_size=8,
+                            max_font_size=None,
+                            min_word_length=2,
+                            collocations=False,
+                            relative_scaling=0.5,
+                            prefer_horizontal=0.9,
+                        ).generate_from_frequencies(freq)
 
-                            # Show in app
-                            st.pyplot(fig, use_container_width=True)
+                        fig, ax = plt.subplots(
+                            figsize=(int(wc_width) / 100, int(wc_height) / 100),
+                            dpi=100
+                        )
+                        ax.imshow(wc_obj, interpolation='bilinear')
+                        ax.axis('off')
+                        fig.patch.set_facecolor(wc_bg)
+                        plt.tight_layout(pad=0)
 
-                            # \u2500\u2500 6. Download \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-                            buf = io.BytesIO()
-                            save_fmt = fmt_choice.lower()
-                            save_kwargs = {
-                                'format':       'jpeg' if save_fmt == 'jpg' else save_fmt,
-                                'dpi':          150,
-                                'bbox_inches':  'tight',
-                                'pad_inches':   0,
-                            }
-                            fig.savefig(buf, **save_kwargs)
-                            buf.seek(0)
-                            plt.close(fig)
+                        # Save PNG + JPG bytes to session state (both formats for download)
+                        _png_buf = io.BytesIO()
+                        fig.savefig(_png_buf, format='png', dpi=150, bbox_inches='tight', pad_inches=0)
+                        _png_buf.seek(0)
+                        _jpg_buf = io.BytesIO()
+                        fig.savefig(_jpg_buf, format='jpeg', dpi=150, bbox_inches='tight', pad_inches=0)
+                        _jpg_buf.seek(0)
+                        plt.close(fig)
 
-                            fname = f"chmura_slow_{wc_var}.{save_fmt}"
-                            mime  = "image/jpeg" if save_fmt == "jpg" else "image/png"
-                            st.download_button(
-                                label=f"\u2b07\ufe0f Pobierz chmur\u0119 ({fmt_choice})",
-                                data=buf.getvalue(),
-                                file_name=fname,
-                                mime=mime,
-                                use_container_width=True,
-                            )
+                        freq_df = pd.DataFrame(
+                            sorted(freq.items(), key=lambda x: x[1], reverse=True),
+                            columns=["S\u0142owo", "Liczba wyst\u0105pie\u0144"]
+                        )
+                        freq_df.index = range(1, len(freq_df) + 1)
 
-                            # \u2500\u2500 7. Frequency table \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-                            with st.expander(
-                                "\U0001f4ca Cz\u0119sto\u015b\u0107 s\u0142\u00f3w w chmurze",
-                                expanded=False
-                            ):
-                                freq_df = pd.DataFrame(
-                                    sorted(freq.items(), key=lambda x: x[1], reverse=True),
-                                    columns=["S\u0142owo", "Liczba wyst\u0105pie\u0144"]
-                                )
-                                freq_df.index = range(1, len(freq_df) + 1)
-                                st.dataframe(freq_df, use_container_width=True, height=300)
+                        _entry = {
+                            'var':          wc_var,
+                            'var_label':    var_labels.get(wc_var, wc_var),
+                            'group_label':  _grp_lbl,
+                            'png_bytes':    _png_buf.getvalue(),
+                            'jpg_bytes':    _jpg_buf.getvalue(),
+                            'default_fmt':  fmt_choice.lower(),
+                            'freq_df':      freq_df,
+                            'n_words':      len(freq),
+                        }
+                        # Replace if same (var, group_label) pair already exists
+                        _merge_result(st.session_state.wordcloud_results, _entry,
+                            key_fn=lambda r: (r.get('var',''), r.get('group_label','')))
 
                     except Exception as _wc_err:
                         st.error(f"B\u0142\u0105d generowania chmury: {_wc_err}")
                         st.exception(_wc_err)
 
+        # \u2500\u2500 Persistent display of wordcloud results with delete UI \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        if st.session_state.wordcloud_results:
+            st.divider()
+            _wcc1, _wcc2 = st.columns([5, 1])
+            _wcc1.markdown(f"**\u2601\ufe0f Zapisane chmury s\u0142\u00f3w ({len(st.session_state.wordcloud_results)}):**")
+            with _wcc2:
+                if st.button("\U0001f5d1\ufe0f Usu\u0144 wszystkie", key="del_all_wc",
+                             use_container_width=True):
+                    st.session_state.wordcloud_results = []
+                    st.rerun()
+
+            for _wci, _wc_entry in enumerate(list(st.session_state.wordcloud_results)):
+                _wc_var   = _wc_entry.get('var', '')
+                _wc_lbl   = _wc_entry.get('var_label', _wc_var)
+                _wc_grp   = _wc_entry.get('group_label', '')
+                _wc_n     = _wc_entry.get('n_words', 0)
+                _wc_fmt   = _wc_entry.get('default_fmt', 'png')
+
+                _title = f"\u2601\ufe0f [{_wc_var}] {_wc_lbl} \u2014 {_wc_n} s\u0142\u00f3w"
+                if _wc_grp:
+                    _title += f" \u2014 \U0001f500 {_wc_grp}"
+
+                _wec1, _wec2 = st.columns([6, 1])
+                with _wec1:
+                    _wcexp = st.expander(_title, expanded=True)
+                with _wec2:
+                    if st.button("\U0001f5d1\ufe0f", key=f"del_wc_{_wci}",
+                                 help=f"Usu\u0144 chmur\u0119 dla {_wc_var}"):
+                        st.session_state.wordcloud_results.pop(_wci)
+                        st.rerun()
+
+                with _wcexp:
+                    _split_badge(_wc_grp)
+
+                    # Display image (use PNG for best quality in browser)
+                    st.image(_wc_entry['png_bytes'], use_container_width=True)
+
+                    # Download buttons
+                    _dc1, _dc2 = st.columns(2)
+                    _safe_lbl = (_wc_grp.replace('=', '_').replace(' ', '_')
+                                 if _wc_grp else 'pelna')
+                    with _dc1:
+                        st.download_button(
+                            label="\u2b07\ufe0f Pobierz (PNG)",
+                            data=_wc_entry['png_bytes'],
+                            file_name=f"chmura_slow_{_wc_var}_{_safe_lbl}.png",
+                            mime="image/png",
+                            use_container_width=True,
+                            key=f"wc_dl_png_{_wci}"
+                        )
+                    with _dc2:
+                        st.download_button(
+                            label="\u2b07\ufe0f Pobierz (JPG)",
+                            data=_wc_entry['jpg_bytes'],
+                            file_name=f"chmura_slow_{_wc_var}_{_safe_lbl}.jpg",
+                            mime="image/jpeg",
+                            use_container_width=True,
+                            key=f"wc_dl_jpg_{_wci}"
+                        )
+
+                    # Frequency table
+                    with st.expander(
+                        "\U0001f4ca Cz\u0119sto\u015b\u0107 s\u0142\u00f3w w chmurze",
+                        expanded=False
+                    ):
+                        st.dataframe(_wc_entry['freq_df'], use_container_width=True, height=300)
+
 
 elif menu == "\U0001f4be Eksport do Excela":
+    _require_module_access("export_excel")
     module_header("\U0001f4be", "Eksport do Excela", "Raport analityczny, wykresy, baza danych, spis tre\u015bci")
 
     # \u2500\u2500 Separate standalone DB download (still available) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -6691,7 +7771,7 @@ elif menu == "\U0001f4be Eksport do Excela":
             help="Dodaje arkusz 'Baza surowa (numeryczna)' z oryginalnymi kodami liczbowymi.",
         )
 
-        if st.button("\U0001f4ca Generuj pe\u0142ny raport analityczny", type="primary", use_container_width=True):
+        if _tracked_button("\U0001f4ca Generuj pe\u0142ny raport analityczny", "export_excel", "generate_report", type="primary", use_container_width=True):
             with st.spinner("Generowanie pliku Excel... To mo\u017ce chwil\u0119 potrwa\u0107."):
                 output = io.BytesIO()
                 try:
@@ -6768,6 +7848,7 @@ elif menu == "\U0001f4be Eksport do Excela":
 # MODUL: EKSPORT DO POWERPOINT
 # =============================================================
 elif menu == "\U0001f4ca Eksport do PowerPoint":
+    _require_module_access("export_pptx")
     module_header("\U0001f4ca", "Eksport do PowerPoint", "Edytowalne wykresy kolumnowe z cz\u0119sto\u015bci i tabel krzy\u017cowych")
     st.info(
         "Generuje plik PowerPoint z edytowalnymi wykresami kolumnowymi. "
@@ -7038,6 +8119,36 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
                 "Poka\u017c baz\u0119 (N) w tytu\u0142ach",
                 value=True, key="ppt_base"
             )
+
+        # \u2500\u2500 Split-aware PPT options \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        _has_split_results = False
+        try:
+            for _k in list(st.session_state.results.get('czestosci', {}).keys()) + \
+                      list(st.session_state.results.get('krzyzowe', {}).keys()):
+                if " | " in _k and "=" in _k.split(" | ", 1)[-1]:
+                    _has_split_results = True
+                    break
+        except Exception:
+            pass
+
+        if _has_split_results:
+            st.markdown("**\U0001f500 Opcje podzia\u0142u na podzbiory:**")
+            spl1, spl2 = st.columns(2)
+            with spl1:
+                ppt_group_slides = st.checkbox(
+                    "Grupuj slajdy wg podzia\u0142u",
+                    value=True, key="ppt_group_slides",
+                    help="Slajdy zostan\u0105 u\u0142o\u017cone wed\u0142ug grup (np. najpierw wszystkie Kobiety, potem wszyscy M\u0119\u017cczy\u017ani) zamiast wg zmiennych."
+                )
+            with spl2:
+                ppt_section_dividers = st.checkbox(
+                    "Dodaj slajd-przerywnik przed ka\u017cd\u0105 grup\u0105",
+                    value=True, key="ppt_section_dividers",
+                    help="Przed pierwszym slajdem ka\u017cdej grupy zostanie wstawiony slajd tytu\u0142owy z nazw\u0105 grupy."
+                )
+        else:
+            ppt_group_slides = False
+            ppt_section_dividers = False
 
         # \u2500\u2500 Motyw kolorystyczny prezentacji \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         tc1, tc2 = st.columns([1, 2])
@@ -7388,10 +8499,67 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
                 use_pct = (ppt_metric == "Procent [%]")
                 prefix  = (ppt_title_prefix.strip() + " " if ppt_title_prefix.strip() else "")
 
+                # Helper: add a big section divider slide with group name
+                def _add_section_divider(prs, title_text):
+                    layout_blank = prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[0]
+                    sld = prs.slides.add_slide(layout_blank)
+                    # Background color bar
+                    from pptx.util import Inches, Pt
+                    from pptx.dml.color import RGBColor
+                    from pptx.enum.shapes import MSO_SHAPE
+                    sw, sh = prs.slide_width, prs.slide_height
+                    bg = sld.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, sw, sh)
+                    try:
+                        _r, _g, _b = _hex_to_rgb(_title_hex)
+                        bg.fill.solid(); bg.fill.fore_color.rgb = RGBColor(_r, _g, _b)
+                        bg.line.fill.background()
+                    except Exception:
+                        pass
+                    # Title text box centered
+                    tb = sld.shapes.add_textbox(Inches(0.5), sh/2 - Inches(1),
+                                                 sw - Inches(1), Inches(2))
+                    tf = tb.text_frame
+                    tf.word_wrap = True
+                    p = tf.paragraphs[0]
+                    p.alignment = 2  # PP_ALIGN.CENTER = 2
+                    run = p.add_run()
+                    run.text = title_text
+                    run.font.size = Pt(36)
+                    run.font.bold = True
+                    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+
+                # Helper: extract group label from a result key (returns '' if none)
+                def _extract_group(k):
+                    if " | " in k and "=" in k.split(" | ", 1)[-1]:
+                        return k.rsplit(" | ", 1)[1]
+                    return ""
+
+                # Reorder keys if grouping requested
+                if ppt_group_slides:
+                    # Stable sort by group label (empty group first = full base)
+                    sel_freq_keys  = sorted(sel_freq_keys,  key=lambda k: _extract_group(k))
+                    sel_cross_keys = sorted(sel_cross_keys, key=lambda k: _extract_group(k))
+
+                # Track current group to emit section dividers
+                _current_group = object()  # sentinel so first comparison differs
+
                 # \u2500\u2500 Frequency tables (single series) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
                 for var_name_key in sel_freq_keys:
                     df_res = freq_res[var_name_key]
                     try:
+                        # Split off group label if present
+                        _base_var = var_name_key
+                        _grp_suffix = ""
+                        if " | " in var_name_key and "=" in var_name_key.split(" | ", 1)[-1]:
+                            _base_var, _grp_suffix = var_name_key.rsplit(" | ", 1)
+
+                        # Section divider if group changes
+                        if ppt_section_dividers and ppt_group_slides and _grp_suffix != _current_group:
+                            _current_group = _grp_suffix
+                            if _grp_suffix:
+                                _add_section_divider(prs, f"\U0001f500 {_grp_suffix}")
+                                slides_added += 1
+
                         df_c = df_res.copy()
                         for sr in ['Suma','Og\u00f3\u0142em (Wa\u017cne)','Og\u00f3\u0142em',
                                    'Braki danych','Brak odpowiedzi']:
@@ -7411,7 +8579,7 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
                         if not cats or all(v != v for v in vals):
                             continue
 
-                        lbl = var_labels.get(var_name_key, var_name_key)
+                        lbl = var_labels.get(_base_var, _base_var)
                         unit = "%" if use_pct else "N"
                         if ppt_show_base:
                             try:
@@ -7428,8 +8596,13 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
                                 sub = f"Warto\u015bci: {unit}"
                         else:
                             sub = f"Warto\u015bci: {unit}"
+                        if _grp_suffix:
+                            sub = f"\U0001f500 {_grp_suffix} | {sub}"
 
-                        _add_chart_slide(prs, f"{prefix}{lbl}"[:120],
+                        _title_txt = f"{prefix}{lbl}"
+                        if _grp_suffix:
+                            _title_txt += f" \u2014 {_grp_suffix}"
+                        _add_chart_slide(prs, _title_txt[:120],
                                          cats, vals, sub, is_pct=use_pct, tpl=freq_tpl_def)
                         slides_added += 1
                     except Exception as _e:
@@ -7477,8 +8650,26 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
                             continue
 
                         unit = "%" if use_pct else "N"
-                        title_s = f"{prefix}{cross_key}"[:120]
+                        # Split off group label from cross_key if present
+                        _base_cross = cross_key
+                        _grp_suffix = ""
+                        if " | " in cross_key and "=" in cross_key.split(" | ", 1)[-1]:
+                            _base_cross, _grp_suffix = cross_key.rsplit(" | ", 1)
+
+                        # Section divider if group changes
+                        if ppt_section_dividers and ppt_group_slides and _grp_suffix != _current_group:
+                            _current_group = _grp_suffix
+                            if _grp_suffix:
+                                _add_section_divider(prs, f"\U0001f500 {_grp_suffix}")
+                                slides_added += 1
+
+                        _title_s = f"{prefix}{_base_cross}"
+                        if _grp_suffix:
+                            _title_s += f" \u2014 {_grp_suffix}"
+                        title_s = _title_s[:120]
                         sub = f"Warto\u015bci: {unit} | Serie = kategorie zmiennej w kolumnach"
+                        if _grp_suffix:
+                            sub = f"\U0001f500 {_grp_suffix} | {sub}"
 
                         _add_cross_chart_slide(prs, title_s, cats,
                                                series_dict, sub, is_pct=use_pct, tpl=cross_tpl_def)
@@ -7507,5 +8698,523 @@ elif menu == "\U0001f4ca Eksport do PowerPoint":
                 st.error(f"B\u0142\u0105d generowania PowerPoint: {_ppt_err}")
                 st.exception(_ppt_err)
 
+# =============================================================
+# PANEL ADMINA
+# =============================================================
+elif menu == "\U0001f512 Panel admina":
+    _require_module_access("admin")
+    module_header("\U0001f512", "Panel admina",
+                  "Zarz\u0105dzanie u\u017cytkownikami, uprawnieniami i aktywno\u015bci\u0105")
+
+    _adm_me = st.session_state.get("current_user_id")
+
+    def _adm_gen_pw(length=12):
+        import random
+        _chars = string.ascii_letters + string.digits + "!@#%^&*"
+        return "".join(random.SystemRandom().choices(_chars, k=length))
+
+    (
+        _adm_tab_users, _adm_tab_perms, _adm_tab_sess,
+        _adm_tab_hist, _adm_tab_act, _adm_tab_stats, _adm_tab_cfg
+    ) = st.tabs([
+        "\U0001f464 U\u017cytkownicy",
+        "\U0001f510 Uprawnienia",
+        "\U0001f4f6 Aktywne sesje",
+        "\U0001f4cb Historia logowa\u0144",
+        "\U0001f4c8 Aktywno\u015b\u0107",
+        "\U0001f4ca Statystyki",
+        "\u2699\ufe0f Ustawienia",
+    ])
+
+    # ============================================================
+    # TAB 1 -- UZYTKOWNICY
+    # ============================================================
+    with _adm_tab_users:
+        st.markdown("### \u2795 Dodaj nowego u\u017cytkownika")
+        with st.form("adm_add_user_form", clear_on_submit=True):
+            _au_c1, _au_c2, _au_c3 = st.columns(3)
+            _au_username = _au_c1.text_input("Nazwa u\u017cytkownika *")
+            _au_role     = _au_c2.selectbox("Rola", ["user", "admin"])
+            _au_expires  = _au_c3.date_input(
+                "Wygasa (puste = bez limitu)", value=None)
+            _au_c4, _au_c5 = st.columns(2)
+            _au_pw_mode   = _au_c4.radio(
+                "Has\u0142o", ["Generuj losowe", "Wpisz r\u0119cznie"], horizontal=True)
+            _au_pw_custom = _au_c5.text_input(
+                "Has\u0142o (je\u015bli r\u0119czne)", type="password")
+            _au_mcp = st.checkbox(
+                "Wymu\u015b zmian\u0119 has\u0142a przy pierwszym logowaniu", value=True)
+            _au_sub = st.form_submit_button(
+                "\u2795 Utw\u00f3rz u\u017cytkownika", type="primary")
+
+        if _au_sub:
+            _au_uname_clean = (_au_username or "").strip().lower()
+            if not _au_uname_clean:
+                st.error("Podaj nazw\u0119 u\u017cytkownika.")
+            elif _get_user_by_name(_au_uname_clean):
+                st.error("U\u017cytkownik '" + _au_uname_clean + "' ju\u017c istnieje.")
+            else:
+                _au_pw_final = _adm_gen_pw() if _au_pw_mode == "Generuj losowe" else _au_pw_custom
+                _au_pw_err = None if _au_mcp else _validate_password_policy(_au_pw_final, _au_uname_clean)
+                if not _au_pw_final:
+                    st.error("Podaj has\u0142o lub wybierz generowanie losowe.")
+                elif _au_pw_err:
+                    st.error("\u274c " + _au_pw_err)
+                else:
+                    _au_h, _au_s = _hash_password(_au_pw_final)
+                    _au_exp_str = _au_expires.isoformat() if _au_expires else None
+                    _au_new_id = get_db().execute(
+                        "INSERT INTO users(username,password_hash,password_salt,role,"
+                        "created_at,created_by,is_active,expires_at,must_change_password)"
+                        " VALUES(?,?,?,?,?,?,1,?,?)",
+                        (_au_uname_clean, _au_h, _au_s, _au_role,
+                         _now_iso(), _adm_me, _au_exp_str, int(_au_mcp))
+                    ).lastrowid
+                    if _au_role == "admin":
+                        for _mk in _MODULE_KEYS.keys():
+                            get_db().execute(
+                                "INSERT OR IGNORE INTO module_permissions"
+                                "(user_id,module_key,granted) VALUES(?,?,1)",
+                                (_au_new_id, _mk))
+                    get_db().execute(
+                        "INSERT INTO audit_log(actor_user_id,target_user_id,"
+                        "event_type,details_json,created_at) VALUES(?,?,?,?,?)",
+                        (_adm_me, _au_new_id, "create_user",
+                         json.dumps({"username": _au_uname_clean, "role": _au_role}),
+                         _now_iso()))
+                    _au_ok_msg = "\u2705 Utworzono u\u017cytkownika **" + _au_uname_clean + "**"
+                    if _au_pw_mode == "Generuj losowe":
+                        _au_ok_msg += "\n\n**Has\u0142o (skopiuj teraz!):** `" + _au_pw_final + "`"
+                    st.success(_au_ok_msg)
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("### \U0001f464 Lista u\u017cytkownik\u00f3w")
+        _au_all = get_db().execute(
+            "SELECT id,username,role,is_active,expires_at,last_login_at,"
+            "failed_login_count,locked_until,must_change_password FROM users"
+            " ORDER BY role DESC,username"
+        ).fetchall()
+
+        for _au_row in _au_all:
+            _au_uid   = _au_row["id"]
+            _au_ud    = _au_row["username"]
+            _au_act   = bool(_au_row["is_active"])
+            _au_lkd   = _is_locked(_au_row)
+            _au_exp_v = _au_row["expires_at"] or "bez limitu"
+            _au_ll    = (_au_row["last_login_at"] or "\u2014")[:16].replace("T", " ")
+            _au_ic    = "\U0001f7e2" if (_au_act and not _au_lkd) else ("\U0001f534" if _au_lkd else "\u26ab")
+            _au_rb    = " [admin]" if _au_row["role"] == "admin" else " [user]"
+            _au_mb    = " \U0001f511" if _au_row["must_change_password"] else ""
+            with st.expander(
+                _au_ic + " " + _au_ud + _au_rb + _au_mb
+                + "   ostatnie log.: " + _au_ll, expanded=False
+            ):
+                _au_a1, _au_a2, _au_a3, _au_a4 = st.columns(4)
+                # Aktywacja/deaktywacja
+                if _au_act:
+                    if _au_a1.button("\u26ab Dezaktywuj", key="adm_deact_" + str(_au_uid)):
+                        get_db().execute("UPDATE users SET is_active=0 WHERE id=?", (_au_uid,))
+                        get_db().execute(
+                            "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
+                            "details_json,created_at) VALUES(?,?,?,?,?)",
+                            (_adm_me, _au_uid, "deactivate",
+                             json.dumps({"username": _au_ud}), _now_iso()))
+                        st.rerun()
+                else:
+                    if _au_a1.button("\U0001f7e2 Aktywuj", key="adm_act_" + str(_au_uid)):
+                        get_db().execute("UPDATE users SET is_active=1 WHERE id=?", (_au_uid,))
+                        get_db().execute(
+                            "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
+                            "details_json,created_at) VALUES(?,?,?,?,?)",
+                            (_adm_me, _au_uid, "activate",
+                             json.dumps({"username": _au_ud}), _now_iso()))
+                        st.rerun()
+                # Odblokowanie
+                if _au_lkd:
+                    if _au_a2.button("\U0001f513 Odblokuj", key="adm_unlock_" + str(_au_uid)):
+                        get_db().execute(
+                            "UPDATE users SET failed_login_count=0,locked_until=NULL WHERE id=?",
+                            (_au_uid,))
+                        get_db().execute(
+                            "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
+                            "details_json,created_at) VALUES(?,?,?,?,?)",
+                            (_adm_me, _au_uid, "unlock",
+                             json.dumps({"username": _au_ud}), _now_iso()))
+                        st.rerun()
+                # Reset hasla
+                if _au_a3.button("\U0001f504 Reset has\u0142a", key="adm_rpw_" + str(_au_uid)):
+                    _au_npw = _adm_gen_pw()
+                    _au_nh, _au_ns = _hash_password(_au_npw)
+                    get_db().execute(
+                        "UPDATE users SET password_hash=?,password_salt=?,"
+                        "must_change_password=1 WHERE id=?",
+                        (_au_nh, _au_ns, _au_uid))
+                    get_db().execute(
+                        "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
+                        "details_json,created_at) VALUES(?,?,?,?,?)",
+                        (_adm_me, _au_uid, "reset_password",
+                         json.dumps({"username": _au_ud}), _now_iso()))
+                    st.success("Nowe has\u0142o **" + _au_ud + "**: `" + _au_npw + "`")
+                # Usuwanie (tylko innych)
+                if _au_uid != _adm_me:
+                    if _au_a4.button("\U0001f5d1\ufe0f Usu\u0144",
+                                     key="adm_del_" + str(_au_uid)):
+                        get_db().execute("DELETE FROM users WHERE id=?", (_au_uid,))
+                        get_db().execute(
+                            "DELETE FROM module_permissions WHERE user_id=?", (_au_uid,))
+                        get_db().execute(
+                            "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
+                            "details_json,created_at) VALUES(?,?,?,?,?)",
+                            (_adm_me, _au_uid, "delete_user",
+                             json.dumps({"username": _au_ud}), _now_iso()))
+                        st.success("U\u017cytkownik **" + _au_ud + "** usuni\u0119ty.")
+                        st.rerun()
+                # Edycja daty wygasniecia
+                st.caption("Wygasa: " + str(_au_exp_v))
+                _au_ne, _au_ec1, _au_ec2 = st.columns([2, 1, 1])
+                _au_new_exp = _au_ne.date_input(
+                    "Nowa data wygasni\u0119cia", value=None,
+                    key="adm_exp_" + str(_au_uid))
+                if _au_ec1.button("Ustaw", key="adm_setexp_" + str(_au_uid)):
+                    _au_ev = _au_new_exp.isoformat() if _au_new_exp else None
+                    get_db().execute(
+                        "UPDATE users SET expires_at=? WHERE id=?", (_au_ev, _au_uid))
+                    get_db().execute(
+                        "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
+                        "details_json,created_at) VALUES(?,?,?,?,?)",
+                        (_adm_me, _au_uid, "set_expires",
+                         json.dumps({"username": _au_ud, "expires_at": _au_ev}),
+                         _now_iso()))
+                    st.success("Zaktualizowano dat\u0119 wygasni\u0119cia.")
+                    st.rerun()
+                if _au_ec2.button("Usu\u0144 limit", key="adm_delexp_" + str(_au_uid)):
+                    get_db().execute(
+                        "UPDATE users SET expires_at=NULL WHERE id=?", (_au_uid,))
+                    get_db().execute(
+                        "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
+                        "details_json,created_at) VALUES(?,?,?,?,?)",
+                        (_adm_me, _au_uid, "remove_expires",
+                         json.dumps({"username": _au_ud}), _now_iso()))
+                    st.success("Usuni\u0119to limit czasu.")
+                    st.rerun()
+
+    # ============================================================
+    # TAB 2 -- UPRAWNIENIA
+    # ============================================================
+    with _adm_tab_perms:
+        st.markdown("### \U0001f510 Matryca uprawnie\u0144 (bez kont admin \u2014 maj\u0105 pe\u0142ny dost\u0119p)")
+        _prm_users = get_db().execute(
+            "SELECT id,username FROM users WHERE role='user' AND is_active=1"
+            " ORDER BY username"
+        ).fetchall()
+        if not _prm_users:
+            st.info("Brak aktywnych u\u017cytkownik\u00f3w z rol\u0105 'user'.")
+        else:
+            _prm_mod_keys = [k for k in _MODULE_KEYS.keys() if k != "admin"]
+            _prm_mod_short = {
+                "dashboard":    "Dashboard", "project":    "Projekt",
+                "prep":         "Przygot.",  "analyses":   "Analizy",
+                "regression":   "Regresja",  "anova":      "ANOVA",
+                "normality":    "Normalno\u015b\u0107", "factor": "Czynnikowa",
+                "cluster":      "Skupienia", "conjoint":   "Conjoint",
+                "maxdiff":      "MaxDiff",   "wordcloud":  "Chmura S\u0142\u00f3w",
+                "export_excel": "Excel",     "export_pptx":"PPT",
+            }
+            _prm_rows = []
+            _prm_uid_map = {}
+            for _pu in _prm_users:
+                _pu_prms = {
+                    r["module_key"]: bool(r["granted"])
+                    for r in get_db().execute(
+                        "SELECT module_key,granted FROM module_permissions WHERE user_id=?",
+                        (_pu["id"],)).fetchall()
+                }
+                _prm_row = {_prm_mod_short.get(k, k): _pu_prms.get(k, False)
+                            for k in _prm_mod_keys}
+                _prm_row["__user__"] = _pu["username"]
+                _prm_rows.append(_prm_row)
+                _prm_uid_map[_pu["username"]] = _pu["id"]
+
+            _prm_df = pd.DataFrame(_prm_rows).set_index("__user__")
+            _prm_edited = st.data_editor(
+                _prm_df, use_container_width=True, key="adm_perm_editor",
+                column_config={c: st.column_config.CheckboxColumn(c)
+                               for c in _prm_df.columns},
+            )
+            if st.button("\U0001f4be Zapisz uprawnienia", type="primary",
+                         key="adm_save_perms"):
+                for _pu_name, _pu_row in _prm_edited.iterrows():
+                    _pu_id = _prm_uid_map.get(_pu_name)
+                    if not _pu_id:
+                        continue
+                    for _sh_key, _granted in _pu_row.items():
+                        _mk = next(
+                            (k for k, v in _prm_mod_short.items() if v == _sh_key), None)
+                        if _mk:
+                            _set_module_perm(_pu_id, _mk, bool(_granted), _adm_me)
+                    # Odswierz uprawnienia w session_state jesli to biezacy user
+                    if _pu_id == st.session_state.get("current_user_id"):
+                        st.session_state.current_user_perms = _load_user_perms(
+                            _pu_id, "user")
+                st.success("\u2705 Uprawnienia zapisane.")
+                st.rerun()
+
+    # ============================================================
+    # TAB 3 -- AKTYWNE SESJE
+    # ============================================================
+    with _adm_tab_sess:
+        st.markdown("### \U0001f4f6 Aktywne sesje")
+        _sess_idle = _get_setting_int("idle_timeout_minutes", 60)
+        _sess_cutoff = (
+            datetime.datetime.utcnow() - datetime.timedelta(minutes=_sess_idle)
+        ).replace(microsecond=0).isoformat()
+        _sess_rows = get_db().execute(
+            "SELECT s.id,s.session_token,s.ip_address,s.geo_country,s.geo_city,"
+            "s.started_at,s.last_seen_at,u.username"
+            " FROM sessions s JOIN users u ON s.user_id=u.id"
+            " WHERE s.ended_at IS NULL AND s.login_success=1"
+            " AND s.last_seen_at > ?"
+            " ORDER BY s.last_seen_at DESC",
+            (_sess_cutoff,)
+        ).fetchall()
+        if not _sess_rows:
+            st.info("Brak aktywnych sesji.")
+        else:
+            for _sr in _sess_rows:
+                _sr_geo = (((_sr["geo_city"] or "") + ", " + (_sr["geo_country"] or "")).strip(", ") or "?")
+                _sr_start = (_sr["started_at"] or "")[:16].replace("T", " ")
+                _sr_last  = (_sr["last_seen_at"] or "")[:16].replace("T", " ")
+                _sc1, _sc2 = st.columns([4, 1])
+                _sc1.markdown(
+                    "**" + _sr["username"] + "** \u2014 IP: `"
+                    + (_sr["ip_address"] or "?") + "` \u2014 Geo: "
+                    + _sr_geo + "  \n"
+                    "\U0001f4c5 Start: " + _sr_start
+                    + "  \u23f0 Ostatnia aktywno\u015b\u0107: " + _sr_last
+                )
+                if _sc2.button("\u21a9\ufe0f Wyloguj",
+                               key="adm_fs_" + str(_sr["id"])):
+                    _end_session(_sr["id"], "admin_force_logout")
+                    get_db().execute(
+                        "INSERT INTO audit_log(actor_user_id,target_user_id,event_type,"
+                        "details_json,created_at) VALUES(?,?,?,?,?)",
+                        (_adm_me, None, "force_logout",
+                         json.dumps({"username": _sr["username"],
+                                     "session_id": _sr["id"]}),
+                         _now_iso()))
+                    st.success("Sesja u\u017cytkownika **" + _sr["username"] + "** zako\u0144czona.")
+                    st.rerun()
+                st.markdown("---")
+
+    # ============================================================
+    # TAB 4 -- HISTORIA LOGOWAN
+    # ============================================================
+    with _adm_tab_hist:
+        st.markdown("### \U0001f4cb Historia logowa\u0144")
+        _hst_c1, _hst_c2, _hst_c3 = st.columns(3)
+        _hst_user_filter = _hst_c1.text_input(
+            "Filtruj u\u017cytkownika", placeholder="wszystkie", key="adm_hf_user")
+        _hst_only_fail = _hst_c2.checkbox("Tylko nieudane", key="adm_hf_fail")
+        _hst_limit = _hst_c3.selectbox("Max wierszy", [50, 100, 250, 500], key="adm_hf_lim")
+        _hst_where = "WHERE 1=1"
+        _hst_params = []
+        if _hst_user_filter:
+            _hst_where += " AND (u.username LIKE ? OR s.attempted_username LIKE ?)"
+            _hst_params += ["%" + _hst_user_filter + "%", "%" + _hst_user_filter + "%"]
+        if _hst_only_fail:
+            _hst_where += " AND s.login_success=0"
+        _hst_q = (
+            "SELECT s.started_at,s.login_success,s.ip_address,s.geo_country,s.geo_city,"
+            "s.logout_reason,s.attempted_username,u.username"
+            " FROM sessions s LEFT JOIN users u ON s.user_id=u.id " + _hst_where
+            + " ORDER BY s.started_at DESC LIMIT ?"
+        )
+        _hst_rows = get_db().execute(_hst_q, _hst_params + [_hst_limit]).fetchall()
+        if not _hst_rows:
+            st.info("Brak rekord\u00f3w spe\u0142niaj\u0105cych kryteria.")
+        else:
+            _hst_data = []
+            for _hr in _hst_rows:
+                _hst_uname = _hr["username"] or _hr["attempted_username"] or "?"
+                _hst_geo = (((_hr["geo_city"] or "") + " " + (_hr["geo_country"] or "")).strip() or "?")
+                _hst_data.append({
+                    "Czas (UTC)":   (_hr["started_at"] or "")[:16].replace("T", " "),
+                    "U\u017cytkownik": _hst_uname,
+                    "Wynik":        "\u2705 OK" if _hr["login_success"] else "\u274c B\u0142\u0105d",
+                    "IP":           _hr["ip_address"] or "?",
+                    "Lokalizacja":  _hst_geo,
+                    "Pow\u00f3d":   _hr["logout_reason"] or "",
+                })
+            st.dataframe(pd.DataFrame(_hst_data), use_container_width=True, hide_index=True)
+
+    # ============================================================
+    # TAB 5 -- AKTYWNOSC
+    # ============================================================
+    with _adm_tab_act:
+        st.markdown("### \U0001f4c8 Log aktywno\u015bci analiz")
+        _act_c1, _act_c2, _act_c3 = st.columns(3)
+        _act_uf  = _act_c1.text_input(
+            "U\u017cytkownik", placeholder="wszyscy", key="adm_af_user")
+        _act_mf  = _act_c2.selectbox(
+            "Modu\u0142", ["-- wszystkie --"] + list(_MODULE_KEYS.keys()),
+            key="adm_af_mod")
+        _act_lim = _act_c3.selectbox(
+            "Max wierszy", [100, 250, 500, 1000], key="adm_af_lim")
+        _act_where = "WHERE 1=1"
+        _act_params = []
+        if _act_uf:
+            _act_where += " AND u.username LIKE ?"
+            _act_params.append("%" + _act_uf + "%")
+        if _act_mf != "-- wszystkie --":
+            _act_where += " AND a.module=?"
+            _act_params.append(_act_mf)
+        _act_rows = get_db().execute(
+            "SELECT a.created_at,a.module,a.action,a.ip_address,a.metadata_json,"
+            "u.username FROM activity_log a"
+            " LEFT JOIN users u ON a.user_id=u.id "
+            + _act_where + " ORDER BY a.created_at DESC LIMIT ?",
+            _act_params + [_act_lim]
+        ).fetchall()
+        if not _act_rows:
+            st.info("Brak rekord\u00f3w.")
+        else:
+            _act_data = []
+            for _ar in _act_rows:
+                _act_data.append({
+                    "Czas (UTC)":   (_ar["created_at"] or "")[:16].replace("T", " "),
+                    "U\u017cytkownik": _ar["username"] or "?",
+                    "Modu\u0142":   _ar["module"] or "",
+                    "Akcja":        _ar["action"] or "",
+                    "IP":           _ar["ip_address"] or "",
+                    "Metadane":     str(_ar["metadata_json"] or "")[:80],
+                })
+            _act_df = pd.DataFrame(_act_data)
+            st.dataframe(_act_df, use_container_width=True, hide_index=True)
+            # Eksport do Excela
+            if st.button("\U0001f4be Eksportuj log do Excela", key="adm_act_export"):
+                _act_buf = io.BytesIO()
+                with pd.ExcelWriter(_act_buf, engine="xlsxwriter") as _act_wr:
+                    _act_df.to_excel(_act_wr, sheet_name="Aktywnosc", index=False)
+                st.download_button(
+                    "\u2b07\ufe0f Pobierz log_aktywnosci.xlsx",
+                    data=_act_buf.getvalue(),
+                    file_name="log_aktywnosci.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+        # Podsumowanie: top uzytkownicy
+        st.markdown("---")
+        st.markdown("**Top u\u017cytkownicy wg liczby analiz**")
+        _top_rows = get_db().execute(
+            "SELECT u.username, COUNT(a.id) as cnt"
+            " FROM activity_log a JOIN users u ON a.user_id=u.id"
+            " WHERE a.module != 'system'"
+            " GROUP BY u.id ORDER BY cnt DESC LIMIT 10"
+        ).fetchall()
+        if _top_rows:
+            _top_df = pd.DataFrame([{"U\u017cytkownik": r["username"],
+                                      "Liczba analiz": r["cnt"]} for r in _top_rows])
+            st.bar_chart(_top_df.set_index("U\u017cytkownik"))
+
+    # ============================================================
+    # TAB 6 -- STATYSTYKI
+    # ============================================================
+    with _adm_tab_stats:
+        st.markdown("### \U0001f4ca Statystyki u\u017cytkowania")
+        _st_c1, _st_c2 = st.columns(2)
+        # Top modulow
+        _st_mod_rows = get_db().execute(
+            "SELECT module, COUNT(*) as cnt FROM activity_log"
+            " WHERE module != 'system' GROUP BY module ORDER BY cnt DESC LIMIT 10"
+        ).fetchall()
+        if _st_mod_rows:
+            with _st_c1:
+                st.markdown("**Top modu\u0142\u00f3w**")
+                _st_mod_df = pd.DataFrame([{"Modu\u0142": r["module"],
+                                             "Analizy": r["cnt"]} for r in _st_mod_rows])
+                st.bar_chart(_st_mod_df.set_index("Modu\u0142"))
+        # Analizy per dzien (30 dni)
+        _st_day_rows = get_db().execute(
+            "SELECT substr(created_at,1,10) as day, COUNT(*) as cnt"
+            " FROM activity_log WHERE module != 'system'"
+            " AND created_at >= date('now','-30 days')"
+            " GROUP BY day ORDER BY day"
+        ).fetchall()
+        if _st_day_rows:
+            with _st_c2:
+                st.markdown("**Analizy / dzie\u0144 (ostatnie 30 dni)**")
+                _st_day_df = pd.DataFrame([{"Dzie\u0144": r["day"],
+                                             "Analizy": r["cnt"]} for r in _st_day_rows])
+                st.bar_chart(_st_day_df.set_index("Dzie\u0144"))
+        # Logowania per kraj
+        _st_geo_rows = get_db().execute(
+            "SELECT geo_country, COUNT(*) as cnt FROM sessions"
+            " WHERE login_success=1 AND geo_country IS NOT NULL"
+            " GROUP BY geo_country ORDER BY cnt DESC"
+        ).fetchall()
+        if _st_geo_rows:
+            st.markdown("**Logowania wg kraju**")
+            _st_geo_df = pd.DataFrame([{"Kraj": r["geo_country"],
+                                         "Logowania": r["cnt"]} for r in _st_geo_rows])
+            try:
+                _st_fig = px.bar(_st_geo_df, x="Kraj", y="Logowania",
+                                 title="Logowania wg kraju")
+                st.plotly_chart(_st_fig, use_container_width=True)
+            except Exception:
+                st.dataframe(_st_geo_df, use_container_width=True, hide_index=True)
+
+    # ============================================================
+    # TAB 7 -- USTAWIENIA
+    # ============================================================
+    with _adm_tab_cfg:
+        st.markdown("### \u2699\ufe0f Ustawienia systemowe")
+        _cfg_rows = get_db().execute("SELECT key,value FROM settings ORDER BY key").fetchall()
+        _cfg_labels = {
+            "idle_timeout_minutes": "Timeout bezczynno\u015bci (minuty)",
+            "lockout_minutes":      "Czas blokady konta po b\u0142\u0119dach (minuty)",
+            "max_fail_attempts":    "Max pr\u00f3b logowania przed blokad\u0105",
+            "min_pw_length":        "Minimalna d\u0142ugo\u015b\u0107 has\u0142a (znaki)",
+            "rate_limit_window":    "Okno rate-limit (minuty)",
+        }
+        _cfg_form_vals = {r["key"]: r["value"] for r in _cfg_rows}
+        with st.form("adm_settings_form"):
+            _cfg_inputs = {}
+            for _ck, _cv in _cfg_form_vals.items():
+                _cfg_inputs[_ck] = st.number_input(
+                    _cfg_labels.get(_ck, _ck),
+                    value=int(_cv),
+                    min_value=1,
+                    key="adm_cfg_" + _ck,
+                )
+            _cfg_sub = st.form_submit_button(
+                "\U0001f4be Zapisz ustawienia", type="primary")
+        if _cfg_sub:
+            for _ck, _cv in _cfg_inputs.items():
+                _set_setting(_ck, str(int(_cv)))
+            st.success("\u2705 Ustawienia zapisane.")
+        st.markdown("---")
+        st.markdown("**Audit log (ostatnie 50 zdarze\u0144)**")
+        _aud_rows = get_db().execute(
+            "SELECT a.created_at,a.event_type,a.details_json,"
+            "ua.username as actor,ut.username as target"
+            " FROM audit_log a"
+            " LEFT JOIN users ua ON a.actor_user_id=ua.id"
+            " LEFT JOIN users ut ON a.target_user_id=ut.id"
+            " ORDER BY a.created_at DESC LIMIT 50"
+        ).fetchall()
+        if _aud_rows:
+            _aud_data = []
+            for _ar in _aud_rows:
+                _aud_data.append({
+                    "Czas":      (_ar["created_at"] or "")[:16].replace("T", " "),
+                    "Zdarzenie": _ar["event_type"] or "",
+                    "Aktor":     _ar["actor"] or "system",
+                    "Cel":       _ar["target"] or "",
+                    "Szczeg\u00f3\u0142y": str(_ar["details_json"] or "")[:100],
+                })
+            st.dataframe(pd.DataFrame(_aud_data), use_container_width=True,
+                         hide_index=True)
+
 else:
     st.info("\U0001f448 Wybierz modu\u0142 z menu bocznego.")
+
