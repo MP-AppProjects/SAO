@@ -2948,13 +2948,18 @@ else:
     uploaded_file = None
     excel_file = st.sidebar.file_uploader("Plik Excel (.xlsx)", type=["xlsx", "xls"], label_visibility="collapsed")
 
-# ?? Stop if no file ???????????????????????????????????????????
-if is_spss and uploaded_file is None:
-    st.info("\U0001f448 Wczytaj plik SPSS (.sav) lub Excel z paska bocznego, aby rozpocz\u0105\u0107 prac\u0119.")
-    st.stop()
-if is_excel and excel_file is None:
-    st.info("\U0001f448 Wczytaj plik SPSS (.sav) lub Excel z paska bocznego, aby rozpocz\u0105\u0107 prac\u0119.")
-    st.stop()
+# Sprawdz czy aktualnie wybrane jest menu Panel admina (nie wymaga pliku)
+_is_admin_menu = (st.session_state.get("current_menu") == _MODULE_KEYS.get("admin"))
+_no_data_file  = (is_spss and uploaded_file is None) or (is_excel and excel_file is None)
+
+# ?? Stop if no file (admin moze pracowac bez pliku) ??????????
+if not _is_admin_menu:
+    if is_spss and uploaded_file is None:
+        st.info("\U0001f448 Wczytaj plik SPSS (.sav) lub Excel z paska bocznego, aby rozpocz\u0105\u0107 prac\u0119.")
+        st.stop()
+    if is_excel and excel_file is None:
+        st.info("\U0001f448 Wczytaj plik SPSS (.sav) lub Excel z paska bocznego, aby rozpocz\u0105\u0107 prac\u0119.")
+        st.stop()
 
 # ?? Excel: sheet selector (shown inline, above spinner) ???????
 if is_excel:
@@ -2977,26 +2982,33 @@ if is_excel:
         )
         st.session_state.excel_sheet = selected_sheet
 
-# ?? Load data ?????????????????????????????????????????????????
-with st.spinner("Wczytywanie i strukturyzowanie bazy..."):
-    if is_spss:
-        df_orig_raw, df_orig, meta_orig = load_spss_data(uploaded_file)
-        loaded_name = uploaded_file.name
-    else:
-        _overrides_json = json.dumps(st.session_state.excel_col_types, sort_keys=True)
-        _missing_json   = json.dumps(st.session_state.custom_missing, sort_keys=True)
-        df_orig_raw, df_orig, meta_orig = load_excel_data(
-            excel_file, selected_sheet,
-            col_type_overrides_json=_overrides_json,
-            custom_missing_json=_missing_json
-        )
-        loaded_name = excel_file.name
-        # Apply text\u2192numeric encoding maps as value labels (only for newly encoded cols)
-        _tnm = getattr(meta_orig, '_text_to_num_maps', {})
-        for _col, _lmap in _tnm.items():
-            if (_col not in st.session_state.custom_val_labels
-                    and _col not in st.session_state.user_cleared_val_labels):
-                st.session_state.custom_val_labels[_col] = _lmap
+# Domyslne wartosci gdy admin bez pliku (nadpisane ponizej jesli plik jest)
+df_orig_raw = pd.DataFrame()
+df_orig     = pd.DataFrame()
+meta_orig   = ExcelMeta([])
+loaded_name = ""
+
+# ?? Load data (pomijane gdy admin bez pliku) ??????????????????
+if not (_is_admin_menu and _no_data_file):
+    with st.spinner("Wczytywanie i strukturyzowanie bazy..."):
+        if is_spss:
+            df_orig_raw, df_orig, meta_orig = load_spss_data(uploaded_file)
+            loaded_name = uploaded_file.name
+        else:
+            _overrides_json = json.dumps(st.session_state.excel_col_types, sort_keys=True)
+            _missing_json   = json.dumps(st.session_state.custom_missing, sort_keys=True)
+            df_orig_raw, df_orig, meta_orig = load_excel_data(
+                excel_file, selected_sheet,
+                col_type_overrides_json=_overrides_json,
+                custom_missing_json=_missing_json
+            )
+            loaded_name = excel_file.name
+            # Apply text\u2192numeric encoding maps as value labels (only for newly encoded cols)
+            _tnm = getattr(meta_orig, '_text_to_num_maps', {})
+            for _col, _lmap in _tnm.items():
+                if (_col not in st.session_state.custom_val_labels
+                        and _col not in st.session_state.user_cleared_val_labels):
+                    st.session_state.custom_val_labels[_col] = _lmap
 
 df_raw = df_orig_raw.copy()
 df     = df_orig.copy()
@@ -3084,11 +3096,12 @@ all_options     = visible_columns + list(st.session_state.mrs_sets.keys()) + lis
 numeric_cols_raw = df_raw.select_dtypes(include=[np.number]).columns.tolist()
 numeric_cols     = [c for c in numeric_cols_raw if c not in hidden_cols and c in visible_columns]
 
-# Sidebar status
+# Sidebar status (tylko gdy plik wczytany)
 st.sidebar.markdown("---")
 n_rows, n_cols = len(df_raw), len(df_raw.columns)
-src_icon = "\U0001f4ca" if is_spss else "\U0001f4c8"
-st.sidebar.success(f"{src_icon} **{loaded_name}**\n\n{n_rows:,} respondent\u00f3w \u00b7 {n_cols} zmiennych")
+if loaded_name:
+    src_icon = "\U0001f4ca" if is_spss else "\U0001f4c8"
+    st.sidebar.success(f"{src_icon} **{loaded_name}**\n\n{n_rows:,} respondent\u00f3w \u00b7 {n_cols} zmiennych")
 
 if st.session_state.weights is not None:
     st.sidebar.markdown("---")
