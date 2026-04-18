@@ -540,21 +540,24 @@ st.markdown("""
 # GATE LOGOWANIA
 # =============================================================
 
-# Idle timeout: jesli uzytkownik zalogowany ale nieaktywny -- wyloguj
+# Idle timeout + walidacja tokenu w DB (wykrywa force-logout z panelu admina)
 if st.session_state.get('authenticated'):
-    _lg_idle_timeout = _get_setting_int("idle_timeout_minutes", 60)
-    _lg_last_ts = st.session_state.get('last_activity_ts', time.time())
-    if time.time() - _lg_last_ts > _lg_idle_timeout * 60:
-        _lg_dead_sid = st.session_state.get('session_db_id')
-        if _lg_dead_sid:
-            _end_session(_lg_dead_sid, "idle_timeout")
+    _lg_token = st.session_state.get('session_token')
+    _lg_db_sess = _validate_session(_lg_token)
+    if _lg_db_sess is None:
+        # Sesja zostala zakonieczona (force-logout lub invalid token)
         st.session_state.clear()
-        st.warning("\u23f0 Sesja wygas\u0142a z powodu bezczynno\u015bci. Zaloguj si\u0119 ponownie.")
+        st.warning("\U0001f512 Twoja sesja zosta\u0142a zako\u0144czona przez administratora. Zaloguj si\u0119 ponownie.")
     else:
-        st.session_state.last_activity_ts = time.time()
-        _lg_live_sid = st.session_state.get('session_db_id')
-        if _lg_live_sid:
-            _touch_session(_lg_live_sid)
+        _lg_idle_timeout = _get_setting_int("idle_timeout_minutes", 60)
+        _lg_last_ts = st.session_state.get('last_activity_ts', time.time())
+        if time.time() - _lg_last_ts > _lg_idle_timeout * 60:
+            _end_session(_lg_db_sess["id"], "idle_timeout")
+            st.session_state.clear()
+            st.warning("\u23f0 Sesja wygas\u0142a z powodu bezczynno\u015bci. Zaloguj si\u0119 ponownie.")
+        else:
+            st.session_state.last_activity_ts = time.time()
+            _touch_session(_lg_db_sess["id"])
 
 # Gate: blokuj nieuprawniony dostep
 if not st.session_state.get('authenticated'):
