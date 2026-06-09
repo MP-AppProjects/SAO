@@ -1,0 +1,1 @@
+z twojej wczesniejszej propozycji, dodaj punkt 14: Wyszukiwarka zmiennych [szybkie] — przy długich listach multiselect (setki zmiennych) filtr po nazwie/etykiecie.
